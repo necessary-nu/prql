@@ -298,7 +298,7 @@ impl Resolver<'_> {
             return vec![wildcard_field];
         }
 
-        for (name, decl) in module.names.iter().sorted_by_key(|(_, d)| d.order) {
+        for (name, decl) in module.names.iter().sorted_by_key(|(n, d)| (d.order, (*n).clone())) {
             res.push(match &decl.kind {
                 DeclKind::Module(submodule) => {
                     let prefix = [prefix.to_vec(), vec![name]].concat();
