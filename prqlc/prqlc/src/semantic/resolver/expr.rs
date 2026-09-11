@@ -313,7 +313,7 @@ impl Resolver<'_> {
             return vec![wildcard_field];
         }
 
-        for (name, decl) in module.names.iter().sorted_by_key(|(_, d)| d.order) {
+        for (name, decl) in module.names.iter().sorted_by_key(|(n, d)| (d.order, *n)) {
             res.push(match &decl.kind {
                 DeclKind::Module(submodule) => {
                     let prefix = [prefix.to_vec(), vec![name]].concat();
@@ -399,4 +399,47 @@ fn ty_of_lineage(lineage: &pl::Lineage) -> Ty {
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use insta::assert_snapshot;
+    use itertools::Itertools;
+
+    use crate::ir::decl::{Decl, DeclKind, Module};
+    use crate::semantic::resolver::Resolver;
+    use crate::utils::IdGenerator;
+
+    /// Declarations that share an order expand by name, not in the order the
+    /// module's `HashMap` happens to iterate them, which changes from one map
+    /// to the next.
+    #[test]
+    fn test_star_expansion_breaks_order_ties_by_name() {
+        let names: HashMap<String, Decl> = ["d", "b", "a", "e", "c"]
+            .into_iter()
+            .enumerate()
+            .map(|(target_id, name)| {
+                let decl = Decl {
+                    kind: DeclKind::Column(target_id),
+                    ..Default::default()
+                };
+                (name.to_string(), decl)
+            })
+            .collect();
+        let module = Module {
+            names,
+            ..Default::default()
+        };
+
+        let prefix = "t".to_string();
+        let fields =
+            Resolver::construct_tuple_from_module(&mut IdGenerator::new(), &[&prefix], &module);
+        let fields = fields
+            .iter()
+            .map(|field| field.kind.as_ident().unwrap().to_string())
+            .join(", ");
+        assert_snapshot!(fields, @"t.a, t.b, t.c, t.d, t.e");
+    }
 }
