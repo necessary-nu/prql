@@ -683,8 +683,16 @@ pub(super) fn translate_cid(cid: rq::CId, ctx: &mut Context) -> Result<ExprOrSou
             }
 
             _ => {
-                let name = ctx.anchor.column_names.get(&cid).cloned();
-                name.expect("name of this column has not been to be set before generating SQL")
+                // Every column referenced after projection must have been named while the
+                // pipeline was anchored (see `pq::gen_query::ensure_names`). Reaching here
+                // means the anchoring missed a reference, which is a compiler bug rather
+                // than anything the user can act on — but it should not abort the process.
+                ctx.anchor.column_names.get(&cid).cloned().ok_or_else(|| {
+                    Error::new_assert(format!(
+                        "no name assigned to {cid:?} ({}) before SQL generation",
+                        column_decl.as_ref()
+                    ))
+                })?
             }
         };
 

@@ -2490,6 +2490,223 @@ fn test_take_10() {
     ");
 }
 
+// `sort | take` is merged by RQ lowering into a single `Take { sort }`. When a later
+// transform undoes the ordering (`group` per the PRQL spec), the standalone `Sort` is
+// dropped and `Take.sort` becomes the only carrier of the ordering that decides *which*
+// rows the take keeps. These pin that the SQL backend still tracks those columns: they
+// must survive the pipeline split, be selected, and be nameable in the ORDER BY.
+#[test]
+fn test_sort_retained_by_take_01() {
+    // `select` drops three of the six sort keys, then `join` + `distinct` force new scopes.
+    // Used to panic in `translate_cid`: "name of this column has not been to be set".
+    assert_snapshot!((compile(r###"
+    from accounts
+    sort {p_id, p_tenant, p_name, p_score, p_rank, nonce}
+    take 2..4
+    select {p_tenant, p_name, nonce}
+    join notes (==p_tenant)
+    group {p_tenant, p_name, nonce} (take 1)
+    "###).unwrap()), @"
+    WITH table_2 AS (
+      SELECT
+        p_tenant,
+        p_name,
+        nonce,
+        p_id,
+        p_score,
+        p_rank
+      FROM
+        accounts
+      ORDER BY
+        p_id,
+        p_tenant,
+        p_name,
+        p_score,
+        p_rank,
+        nonce
+      LIMIT
+        3 OFFSET 1
+    ),
+    table_1 AS (
+      SELECT
+        p_tenant,
+        p_name,
+        nonce
+      FROM
+        table_2
+    ),
+    table_0 AS (
+      SELECT
+        table_1.p_tenant,
+        table_1.p_name,
+        table_1.nonce,
+        notes.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY table_1.p_tenant,
+          table_1.p_name,
+          table_1.nonce
+        ) AS _expr_1
+      FROM
+        table_1
+        INNER JOIN notes ON table_1.p_tenant = notes.p_tenant
+    )
+    SELECT
+      *
+    FROM
+      table_0
+    WHERE
+      _expr_1 <= 1
+    ");
+}
+
+#[test]
+fn test_sort_retained_by_take_02() {
+    // The same blind spot with an aggregate rather than a join forcing the new scope.
+    assert_snapshot!((compile(r###"
+    from t
+    sort a
+    take 5
+    group {b} (aggregate {s = sum c})
+    "###).unwrap()), @"
+    WITH table_1 AS (
+      SELECT
+        b,
+        c,
+        a
+      FROM
+        t
+      ORDER BY
+        a
+      LIMIT
+        5
+    ), table_0 AS (
+      SELECT
+        b,
+        c
+      FROM
+        table_1
+    )
+    SELECT
+      b,
+      COALESCE(SUM(c), 0) AS s
+    FROM
+      table_0
+    GROUP BY
+      b
+    ");
+}
+
+#[test]
+fn test_sort_retained_by_take_03() {
+    // The sort key is a computed column, so it has to be materialized in the CTE that
+    // carries the ORDER BY and then dropped again by the projecting SELECT.
+    assert_snapshot!((compile(r###"
+    from t
+    derive {x = a + b}
+    sort x
+    take 2..4
+    select {c}
+    join u (==c)
+    group {c} (take 1)
+    "###).unwrap()), @"
+    WITH table_2 AS (
+      SELECT
+        c,
+        a + b AS _expr_2
+      FROM
+        t
+      ORDER BY
+        _expr_2
+      LIMIT
+        3 OFFSET 1
+    ),
+    table_1 AS (
+      SELECT
+        c
+      FROM
+        table_2
+    ),
+    table_0 AS (
+      SELECT
+        table_1.c,
+        u.*,
+        ROW_NUMBER() OVER (PARTITION BY table_1.c) AS _expr_1
+      FROM
+        table_1
+        INNER JOIN u ON table_1.c = u.c
+    )
+    SELECT
+      *
+    FROM
+      table_0
+    WHERE
+      _expr_1 <= 1
+    ");
+}
+
+#[test]
+fn test_take_before_distinct_01() {
+    // SQL evaluates DISTINCT before ORDER BY/LIMIT, but PRQL runs the `take` before the
+    // `group ... (take 1)` that becomes the DISTINCT, so they cannot share one SELECT.
+    // Sharing one also dragged the take's sort key into the DISTINCT key.
+    assert_snapshot!((compile(r###"
+    from t
+    sort a
+    take 2..4
+    select {b, c}
+    group {b, c} (take 1)
+    "###).unwrap()), @"
+    WITH table_1 AS (
+      SELECT
+        b,
+        c,
+        a
+      FROM
+        t
+      ORDER BY
+        a
+      LIMIT
+        3 OFFSET 1
+    ),
+    table_0 AS (
+      SELECT
+        b,
+        c
+      FROM
+        table_1
+    )
+    SELECT
+      DISTINCT b,
+      c
+    FROM
+      table_0
+    ");
+}
+
+#[test]
+fn test_take_before_distinct_02() {
+    // Same split with no sort involved at all.
+    assert_snapshot!((compile(r###"
+    from t
+    take 2..4
+    select {b}
+    group {b} (take 1)
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        b
+      FROM
+        t
+      LIMIT
+        3 OFFSET 1
+    )
+    SELECT
+      DISTINCT b
+    FROM
+      table_0
+    ");
+}
+
 #[test]
 fn test_take_mssql() {
     assert_snapshot!((compile(r#"
@@ -2547,6 +2764,10 @@ fn test_take_mssql() {
 fn test_mssql_distinct_fetch() {
     // Issue #5628: MSSQL requires ORDER BY items to appear in SELECT list when DISTINCT is used.
     // Using (SELECT NULL) for ORDER BY with DISTINCT is invalid in MSSQL.
+    //
+    // `take` now splits from a following `distinct` (SQL evaluates DISTINCT before
+    // ORDER BY/LIMIT, whereas PRQL runs the `take` first), so the FETCH lands in a CTE
+    // that carries no DISTINCT and `(SELECT NULL)` is valid there.
 
     // Case 1: UnnamedExpr - simple column reference
     assert_snapshot!((compile(r#"
@@ -2557,14 +2778,23 @@ fn test_mssql_distinct_fetch() {
     group {this.`District`} (take 1)
     select {this.`District`}
     "#).unwrap()), @r#"
+    WITH table_0 AS (
+      SELECT
+        "District"
+      FROM
+        t
+      ORDER BY
+        (
+          SELECT
+            NULL
+        ) OFFSET 0 ROWS
+      FETCH FIRST
+        100 ROWS ONLY
+    )
     SELECT
       DISTINCT "District"
     FROM
-      t
-    ORDER BY
-      "District" OFFSET 0 ROWS
-    FETCH FIRST
-      100 ROWS ONLY
+      table_0
     "#);
 
     // Case 2: ExprWithAlias - uses the alias for ORDER BY
@@ -2576,14 +2806,23 @@ fn test_mssql_distinct_fetch() {
     group {d = this.`District`} (take 1)
     select {d}
     "#).unwrap()), @r#"
+    WITH table_0 AS (
+      SELECT
+        "District" AS d
+      FROM
+        t
+      ORDER BY
+        (
+          SELECT
+            NULL
+        ) OFFSET 0 ROWS
+      FETCH FIRST
+        100 ROWS ONLY
+    )
     SELECT
-      DISTINCT "District" AS d
+      DISTINCT d
     FROM
-      t
-    ORDER BY
-      d OFFSET 0 ROWS
-    FETCH FIRST
-      100 ROWS ONLY
+      table_0
     "#);
 
     // Case 3: Multiple columns - uses first column for ORDER BY
@@ -2595,15 +2834,25 @@ fn test_mssql_distinct_fetch() {
     group {this.`A`, this.`B`} (take 1)
     select {this.`A`, this.`B`}
     "#).unwrap()), @r#"
+    WITH table_0 AS (
+      SELECT
+        "A",
+        "B"
+      FROM
+        t
+      ORDER BY
+        (
+          SELECT
+            NULL
+        ) OFFSET 0 ROWS
+      FETCH FIRST
+        100 ROWS ONLY
+    )
     SELECT
       DISTINCT "A",
       "B"
     FROM
-      t
-    ORDER BY
-      "A" OFFSET 0 ROWS
-    FETCH FIRST
-      100 ROWS ONLY
+      table_0
     "#);
 }
 
