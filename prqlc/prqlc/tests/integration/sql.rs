@@ -1449,6 +1449,182 @@ select {`hash`}
     ");
 }
 
+// A relation's ordering outlives the `select` that drops its keys, so the sort columns have
+// to cross every scope boundary between where they are defined and where the ORDER BY lands.
+// These pin that they are rewritten into cids the enclosing scope actually exposes: reading
+// from a CTE means using the names that CTE projects, and qualifying with a relation that is
+// in the enclosing FROM.
+#[test]
+fn test_cte_sort_column_scope_01() {
+    // `trimmed` used to re-materialize the hidden sort columns from the expressions that
+    // defined them one scope in — `id AS e_id, name AS e_name` — but it reads from `renamed`,
+    // which projects `e_id`/`e_name` and has no `id` or `name`. PostgreSQL: 42703.
+    assert_snapshot!((compile(r###"
+    let renamed = (
+      from employees
+      select {e_id = id, e_name = name, e_salary = salary}
+      sort {e_id, e_name}
+    )
+    let trimmed = (
+      from renamed
+      select {e_salary}
+    )
+    from trimmed
+    "###).unwrap()), @"
+    WITH renamed AS (
+      SELECT
+        id AS e_id,
+        name AS e_name,
+        salary AS e_salary
+      FROM
+        employees
+    ),
+    trimmed AS (
+      SELECT
+        e_salary,
+        e_id,
+        e_name
+      FROM
+        renamed
+    )
+    SELECT
+      e_salary
+    FROM
+      trimmed
+    ORDER BY
+      e_id,
+      e_name
+    ");
+}
+
+#[test]
+fn test_cte_sort_column_scope_02() {
+    // The ORDER BY used to read `employees.tenure`, naming the base table that only exists
+    // inside the `newest` CTE. PostgreSQL: 42P01.
+    assert_snapshot!((compile(r###"
+    let newest = (
+      from employees
+      sort tenure
+      take 5
+    )
+    from newest
+    join salaries (this.id == that.employee_id)
+    select {newest.name, salaries.salary}
+    "###).unwrap()), @"
+    WITH newest AS (
+      SELECT
+        *
+      FROM
+        employees
+      ORDER BY
+        tenure
+      LIMIT
+        5
+    )
+    SELECT
+      newest.name,
+      salaries.salary
+    FROM
+      newest
+      INNER JOIN salaries ON newest.id = salaries.employee_id
+    ORDER BY
+      newest.tenure
+    ");
+}
+
+#[test]
+fn test_cte_sort_column_scope_03() {
+    // Same, one level deeper: the `take` before the `sort` splits the CTE in two, and the
+    // ORDER BY used to name the inner half (`table_0.e_key`), which the outer query cannot
+    // see. PostgreSQL: 42P01.
+    assert_snapshot!((compile(r###"
+    let ranked = (
+      from employees
+      select {e_id = id, e_name = name, e_tenure = tenure}
+      take 5
+      derive {e_key = e_id}
+      sort {e_key, e_tenure}
+    )
+    from ranked
+    join salaries (this.e_id == that.employee_id)
+    select {ranked.e_name, salaries.salary}
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        id AS e_id,
+        name AS e_name,
+        tenure AS e_tenure,
+        id AS e_key
+      FROM
+        employees
+      LIMIT
+        5
+    ), ranked AS (
+      SELECT
+        e_id,
+        e_name,
+        e_tenure,
+        e_key
+      FROM
+        table_0
+    )
+    SELECT
+      ranked.e_name,
+      salaries.salary
+    FROM
+      ranked
+      INNER JOIN salaries ON ranked.e_id = salaries.employee_id
+    ORDER BY
+      ranked.e_key,
+      ranked.e_tenure
+    ");
+}
+
+#[test]
+fn test_sort_alias_choice_is_deterministic() {
+    // `c` and `d` are both pure renames of `a`, so either may stand in for `a` in the ORDER BY.
+    // The choice used to fall out of HashMap iteration order, so the same query could compile
+    // to `ORDER BY "inner".c` or `ORDER BY "inner".d` from one run to the next. Take the
+    // rename declared first.
+    let query = r###"
+    let inner = (
+      from t
+      select {a = x, b = y}
+      derive {c = a, d = a}
+      sort {a, b}
+    )
+    from inner
+    join u (==b)
+    select {inner.b, inner.c}
+    "###;
+
+    let sql = compile(query).unwrap();
+    assert_snapshot!(sql, @r#"
+    WITH "inner" AS (
+      SELECT
+        x AS a,
+        y AS b,
+        x AS c,
+        x AS d
+      FROM
+        t
+    )
+    SELECT
+      "inner".b,
+      "inner".c
+    FROM
+      "inner"
+      INNER JOIN u ON "inner".b = u.b
+    ORDER BY
+      "inner".c,
+      "inner".b
+    "#);
+
+    for _ in 0..16 {
+        assert_eq!(compile(query).unwrap(), sql);
+    }
+}
+
 #[test]
 fn test_sorts_01() {
     assert_snapshot!((compile(r###"
@@ -3753,7 +3929,7 @@ fn test_prql_to_sql_table() {
       newest_employees
       INNER JOIN average_salaries ON newest_employees.country = average_salaries.country
     ORDER BY
-      employees.tenure
+      newest_employees.tenure
     "
     );
 }
