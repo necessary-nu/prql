@@ -51,6 +51,17 @@ struct SortingInference<'a> {
 }
 
 impl SortingInference<'_> {
+    /// Assign names to the columns of a sorting this pass is about to materialize.
+    ///
+    /// `pq::gen_query::ensure_names` gives this guarantee to every Sort present when a pipeline
+    /// is anchored, but sorting inferred here is introduced afterwards — and it is rendered
+    /// into ORDER BY post-projection, where a column is resolved through `column_names` alone.
+    fn ensure_sort_names(&mut self, sorting: &Sorting) {
+        for sort in sorting {
+            self.ctx.anchor.ensure_column_name(sort.column);
+        }
+    }
+
     /// Prepares the last sorting that will be appended to the pipeline of the `SqlQuery` by
     /// `fold_sql_query`. It does so by reverting all columns in the sorting to their very first
     /// form, and then transforming their value in the final select, while applying
@@ -67,23 +78,25 @@ impl SortingInference<'_> {
             .collect::<HashMap<_, _>>();
 
         // a map of column -> alias
-        let column_aliases = self
-            .ctx
-            .anchor
-            .column_decls
-            .values()
-            .filter_map(|col| {
-                if let ColumnDecl::Compute(compute) = col {
-                    if let ExprKind::ColumnRef(referenced_id) = compute.expr.kind {
-                        Some((referenced_id, compute.id))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect::<HashMap<_, _>>();
+        //
+        // Several columns can be pure renames of the same source (`derive {c = a, d = a}`), so
+        // this is a choice, not a lookup. `column_decls` is a HashMap, so collecting straight
+        // into a map let iteration order decide which rename won, and the same query could
+        // emit a different ORDER BY from one run to the next. Take the lowest id — the rename
+        // declared first — so the choice is total.
+        let mut column_aliases: HashMap<CId, CId> = HashMap::new();
+        for col in self.ctx.anchor.column_decls.values() {
+            let ColumnDecl::Compute(compute) = col else {
+                continue;
+            };
+            let ExprKind::ColumnRef(referenced_id) = compute.expr.kind else {
+                continue;
+            };
+            column_aliases
+                .entry(referenced_id)
+                .and_modify(|chosen| *chosen = (*chosen).min(compute.id))
+                .or_insert(compute.id);
+        }
         log::debug!(".. column aliases: {column_aliases:?}");
 
         // column -> list of tables that did a revert
@@ -299,6 +312,7 @@ impl PqFold for SortingInference<'_> {
             );
             log::debug!("--== redirected last sorting: {redirected_last_sorting:?}");
 
+            self.ensure_sort_names(&redirected_last_sorting);
             pipeline.push(SqlTransform::Sort(redirected_last_sorting));
         }
 

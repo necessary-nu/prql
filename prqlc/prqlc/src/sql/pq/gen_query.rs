@@ -195,6 +195,7 @@ pub(super) fn compile_relation_instance(riid: RIId, ctx: &mut Context) -> Result
 
             // return a sub-query
             let relation = compile_relation(sql_relation, ctx)?;
+            adopt_cid_redirects(riid, &relation, ctx);
             return Ok(pq::RelationExpr {
                 kind: pq::RelationExprKind::SubQuery(relation),
                 riid,
@@ -202,6 +203,7 @@ pub(super) fn compile_relation_instance(riid: RIId, ctx: &mut Context) -> Result
         }
 
         let relation = compile_relation(sql_relation, ctx)?;
+        adopt_cid_redirects(riid, &relation, ctx);
 
         if let pq::SqlRelation::AtomicPipeline(pipeline) = &relation {
             // Finding the last select statement of the pipeline
@@ -262,6 +264,64 @@ pub(super) fn compile_relation_instance(riid: RIId, ctx: &mut Context) -> Result
         kind: pq::RelationExprKind::Ref(source),
         riid,
     })
+}
+
+/// Give a relation instance the mapping from the cids *inside* the relation it reads to its
+/// own cids.
+///
+/// Instances created by [anchor_split] are handed a `cid_redirects` map when they are built,
+/// because the split invents both sides. Instances created by [preprocess] for a `From` or
+/// `Join` of a declared table get `HashMap::new()`: at that point the table is still just a
+/// [TId] and its pipeline has not been lowered, so its output cids do not exist yet.
+///
+/// They exist once the relation has been compiled, and they line up positionally with the
+/// instance's own columns — both follow the table's declared column order (see
+/// [AnchorContext::load_names], which zips the same two lists). Record the mapping now, so
+/// that anything later phrased in the relation's interior cids — chiefly the sorting that
+/// [postprocess::infer_sorts] inherits from a CTE — can be translated into cids that the
+/// enclosing scope actually exposes.
+///
+/// Without this the redirect is silently the identity ([CidRedirector::fold_cid] falls back to
+/// the input cid), and interior cids leak outwards: a `Compute` gets re-materialized from its
+/// original expression against the wrong relation, and a `RelationColumn` gets qualified with
+/// a table name that is not in the enclosing FROM.
+fn adopt_cid_redirects(riid: RIId, relation: &pq::SqlRelation, ctx: &mut Context) {
+    let instance = &ctx.anchor.relation_instances[&riid];
+    if !instance.cid_redirects.is_empty() {
+        // built by `anchor_split`, which already knows both sides
+        return;
+    }
+
+    let pq::SqlRelation::AtomicPipeline(pipeline) = relation else {
+        // literals, s-strings and operators have no interior cids
+        return;
+    };
+    let Some(interior) = pipeline.iter().rev().find_map(|transform| match transform {
+        pq::SqlTransform::Select(cids) => Some(cids),
+        _ => None,
+    }) else {
+        return;
+    };
+
+    let exterior = &instance.original_cids;
+    if interior.len() != exterior.len() {
+        // the positional correspondence is the only thing that makes this sound, so decline
+        // rather than guess when it does not hold
+        log::debug!(
+            "not adopting cid redirects for {riid:?}: {} interior columns vs {} exterior",
+            interior.len(),
+            exterior.len()
+        );
+        return;
+    }
+
+    let redirects = std::iter::zip(interior.iter().copied(), exterior.iter().copied()).collect();
+    log::debug!("adopted cid redirects for {riid:?}: {redirects:?}");
+    ctx.anchor
+        .relation_instances
+        .get_mut(&riid)
+        .unwrap()
+        .cid_redirects = redirects;
 }
 
 fn compile_loop(
