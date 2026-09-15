@@ -363,9 +363,22 @@ fn is_split_required(transform: &SqlTransform, following: &mut HashSet<String>) 
 
         // Sort will be pushed down the CTEs, so there is no point in splitting for it.
         // Super(Sort(_)) => contains_any(following, ["From", "Join", "Compute", "Aggregate"]),
+        // A Take followed by a Distinct must split: SQL evaluates DISTINCT before
+        // ORDER BY / LIMIT, while PRQL's `take` happens before the `group ... (take 1)`
+        // that produced the Distinct. Sharing one SELECT also forces the take's sort
+        // columns into the DISTINCT key, changing which rows survive.
         Super(Take(_)) => contains_any(
             following,
-            ["From", "Join", "Compute", "Filter", "Aggregate", "Sort"],
+            [
+                "From",
+                "Join",
+                "Compute",
+                "Filter",
+                "Aggregate",
+                "Sort",
+                "Distinct",
+                "DistinctOn",
+            ],
         ),
         SqlTransform::DistinctOn(_) => contains_any(
             following,
@@ -575,11 +588,27 @@ pub(super) fn get_requirements(
             // Since there is aggregation anyway, columns can have any complexity
             .allow_up_to(Complexity::highest()),
 
-        Super(Transform::Take(rq::Take { range, .. })) => [&range.start, &range.end]
-            .into_iter()
-            .flatten()
-            .map(Requirements::from_expr)
-            .fold(Requirements::default(), Requirements::append),
+        Super(Transform::Take(rq::Take { range, sort, .. })) => {
+            let range_requirements = [&range.start, &range.end]
+                .into_iter()
+                .flatten()
+                .map(Requirements::from_expr)
+                .fold(Requirements::default(), Requirements::append);
+
+            // `sort | take` is merged into a single Take by RQ lowering, and when a later
+            // `group` marks the ordering as undone the standalone Sort transform is dropped
+            // entirely (see Flattener::sort_undone). The embedded sort is then the only
+            // carrier of the ordering that decides *which* rows the take keeps, and
+            // postprocess::infer_sorts will materialize it back into an ORDER BY of this
+            // SELECT. So it places exactly the same demands on its columns as a standalone
+            // Sort does: they must survive the split and be selected, so they can be named
+            // and referenced post-projection.
+            range_requirements.append(
+                Requirements::from_cids(sort.iter().map(|s| &s.column))
+                    .allow_up_to(Complexity::Aggregation)
+                    .should_select(true),
+            )
+        }
 
         SqlTransform::Join { filter, .. } => Requirements::from_expr(filter),
 

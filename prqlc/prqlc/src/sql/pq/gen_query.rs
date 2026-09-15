@@ -329,12 +329,20 @@ fn compile_loop(
 
 fn ensure_names(transforms: &[pq::SqlTransform], ctx: &mut AnchorContext) {
     for t in transforms {
-        if let pq::SqlTransform::Super(rq::Transform::Sort(columns))
-        | pq::SqlTransform::Sort(columns) = t
-        {
-            for r in columns {
-                ctx.ensure_column_name(r.column);
+        // A sort can reach ORDER BY either as a standalone transform or embedded in a Take
+        // (RQ lowering merges `sort | take`, and drops the standalone Sort when a later
+        // `group` undoes the ordering). Both are rendered post-projection, so both need
+        // their columns named.
+        let columns = match t {
+            pq::SqlTransform::Super(rq::Transform::Sort(columns))
+            | pq::SqlTransform::Sort(columns) => columns,
+            pq::SqlTransform::Super(rq::Transform::Take(take)) | pq::SqlTransform::Take(take) => {
+                &take.sort
             }
+            _ => continue,
+        };
+        for r in columns {
+            ctx.ensure_column_name(r.column);
         }
     }
 }
