@@ -12,6 +12,16 @@ pub(crate) fn compile(prql: &str) -> Result<String, ErrorMessages> {
     )
 }
 
+fn compile_unformatted(prql: &str) -> Result<String, ErrorMessages> {
+    prqlc::compile(
+        prql,
+        &Options::default()
+            .no_signature()
+            .no_format()
+            .with_display(prqlc::DisplayOptions::Plain),
+    )
+}
+
 fn compile_with_sql_dialect(prql: &str, dialect: sql::Dialect) -> Result<String, ErrorMessages> {
     prqlc::compile(
         prql,
@@ -4268,6 +4278,156 @@ fn test_ident_escaping() {
     FROM
       `anim"ls`
     "#);
+}
+
+/// Rendering a name into a quoted SQL identifier must be injective: two distinct
+/// names can never produce the same SQL. A name holding *two* quote characters
+/// used to collapse onto the name holding one, because the emitter handed the raw
+/// name to an escaper that treats an already-doubled quote as "already escaped"
+/// and passes it through.
+#[test]
+fn test_ident_escaping_injective() {
+    // One quote character in the name.
+    assert_snapshot!(compile(r#"from accounts | select {`a"b` = id}"#).unwrap(), @r#"
+    SELECT
+      id AS "a""b"
+    FROM
+      accounts
+    "#);
+
+    // Two quote characters in the name. Must not render the same as the above.
+    assert_snapshot!(compile(r#"from accounts | select {`a""b` = id}"#).unwrap(), @r#"
+    SELECT
+      id AS "a""""b"
+    FROM
+      accounts
+    "#);
+
+    // Three, to show the doubling is per-character and not per-run.
+    assert_snapshot!(compile(r#"from accounts | select {`a"""b` = id}"#).unwrap(), @r#"
+    SELECT
+      id AS "a""""""b"
+    FROM
+      accounts
+    "#);
+
+    // A backslash before the quote must not be read as an escape either: SQL
+    // quoted identifiers have no backslash escape, so the quote still doubles.
+    //
+    // Asserted unformatted, because `sqlformat` (the pretty-printer, a separate
+    // crate) mis-tokenizes `\"` as an escaped quote and breaks the identifier
+    // apart when re-indenting. That is a defect downstream of the emitter.
+    assert_snapshot!(
+        compile_unformatted(r#"from accounts | select {`a\"b` = id}"#).unwrap(),
+        @r#"SELECT id AS "a\""b" FROM accounts"#
+    );
+}
+
+/// The same property in every identifier position the emitter can reach.
+#[test]
+fn test_ident_escaping_positions() {
+    // Table name.
+    assert_snapshot!(compile(r#"from `t""bl` | select {id}"#).unwrap(), @r#"
+    SELECT
+      id
+    FROM
+      "t""""bl"
+    "#);
+
+    // Column name (a reference, not an alias).
+    assert_snapshot!(compile(r#"from accounts | select {`c""ol`}"#).unwrap(), @r#"
+    SELECT
+      "c""""ol"
+    FROM
+      accounts
+    "#);
+
+    // Column name qualified by a table name, both quote-bearing.
+    assert_snapshot!(compile(r#"
+    from `t""bl`
+    join `o""th` (`t""bl`.`c""ol` == `o""th`.`d""ol`)
+    select {`t""bl`.`c""ol`, `o""th`.`d""ol`}
+    "#).unwrap(), @r#"
+    SELECT
+      "t""""bl"."c""""ol",
+      "o""""th"."d""""ol"
+    FROM
+      "t""""bl"
+      INNER JOIN "o""""th" ON "t""""bl"."c""""ol" = "o""""th"."d""""ol"
+    "#);
+
+    // Table alias.
+    assert_snapshot!(compile(r#"
+    from `t""bl`
+    join `s""ide` = `o""th` (`t""bl`.id == `s""ide`.id)
+    select {`s""ide`.id}
+    "#).unwrap(), @r#"
+    SELECT
+      "s""""ide".id
+    FROM
+      "t""""bl"
+      INNER JOIN "o""""th" AS "s""""ide" ON "t""""bl".id = "s""""ide".id
+    "#);
+
+    // CTE name.
+    assert_snapshot!(compile(r#"
+    let `c""te` = (from accounts | filter id > 1)
+    from `c""te`
+    join accounts (this.id == that.id)
+    "#).unwrap(), @r#"
+    WITH "c""""te" AS (
+      SELECT
+        *
+      FROM
+        accounts
+      WHERE
+        id > 1
+    )
+    SELECT
+      "c""""te".*,
+      accounts.*
+    FROM
+      "c""""te"
+      INNER JOIN accounts ON "c""""te".id = accounts.id
+    "#);
+}
+
+/// A backtick is the character PRQL itself quotes with, and the lexer's
+/// backtick-quoted ident has no escape for it (`none_of('`')`). So a name
+/// holding a backtick is not expressible — and worse, the attempt is not
+/// rejected: `` `a``b` `` lexes as the two adjacent idents `a` and `b`, which
+/// the parser reads as a function application.
+///
+/// This is the same class of defect as the emitter's, one level up, but fixing
+/// it means giving the PRQL surface grammar an escape, which is a language
+/// change rather than a bug fix. Pinned here so the gap is visible.
+#[test]
+fn test_ident_backtick_is_not_expressible() {
+    // Usually a hard error...
+    assert!(compile(r#"from accounts | select {`a``b` = id}"#).is_err());
+
+    // ...but when the two halves happen to read as a function application, the
+    // query silently compiles to something else entirely. This asks for a
+    // column named ``min`salary`` and gets the aggregate `min salary`.
+    assert_snapshot!(
+        compile_unformatted(r#"from employees | aggregate {y = `min``salary`}"#).unwrap(),
+        @"SELECT MIN(salary) AS y FROM employees"
+    );
+}
+
+/// The MySQL family quotes with a backtick, so the backtick is the character
+/// that has to double there — and a double quote must be left alone.
+#[test]
+fn test_ident_escaping_injective_mysql() {
+    assert_snapshot!(
+        compile_with_sql_dialect(r#"from accounts | select {`a""b` = id}"#, sql::Dialect::MySql).unwrap(),
+        @r#"
+    SELECT
+      id AS `a""b`
+    FROM
+      accounts
+    "#
+    );
 }
 
 #[test]

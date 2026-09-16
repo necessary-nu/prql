@@ -798,11 +798,19 @@ pub(super) fn translate_select_item(cid: rq::CId, ctx: &mut Context) -> Result<S
     }
     .filter(|n| *n != "*");
 
-    let expected = ctx.anchor.column_names.get(&cid);
+    let expected = ctx.anchor.column_names.get(&cid).cloned();
 
-    if inferred_name != expected {
+    // `inferred_name` is read back off an ident that has already been through
+    // `translate_ident_part`, so its delimiters are doubled. Put the expected
+    // name through the same rendering before comparing, or a name carrying a
+    // delimiter would never match itself and would pick up a redundant alias.
+    let expected_rendered = expected
+        .as_ref()
+        .map(|name| translate_ident_part(name.clone(), ctx).value);
+
+    if inferred_name != expected_rendered.as_ref() {
         // use expected name
-        let ident = expected.cloned().unwrap_or_else(|| {
+        let ident = expected.unwrap_or_else(|| {
             // or use something that will not clash with other names
             ctx.anchor.col_name.gen()
         });
@@ -968,13 +976,40 @@ pub(super) fn translate_ident_part(ident: String, ctx: &Context) -> sql_ast::Ide
             if is_bare && !keywords::is_keyword(&ident, &ctx.dialect_enum) {
                 sql_ast::Ident::new(ident)
             } else {
-                sql_ast::Ident::with_quote(ctx.dialect.ident_quote(), ident)
+                quoted_ident(ident, ctx.dialect.ident_quote())
             }
         }
-        IdentQuotingStyle::AlwaysQuoted => {
-            sql_ast::Ident::with_quote(ctx.dialect.ident_quote(), ident)
-        }
+        IdentQuotingStyle::AlwaysQuoted => quoted_ident(ident, ctx.dialect.ident_quote()),
     }
+}
+
+/// Render a name as a quoted SQL identifier, doubling every delimiter it
+/// contains.
+///
+/// The doubling has to happen here rather than being left to sqlparser.
+/// `Display for Ident` escapes through `value::escape_quoted_string`, which is
+/// deliberately ambiguity-tolerant: it "doesn't know which mode of escape was
+/// chosen by the user", so it treats a delimiter that is *already* doubled (or
+/// preceded by a backslash) as already-escaped and passes it through, doubling
+/// only a lone one. That mapping is not injective — the names `a"b` and `a""b`
+/// both come out as `"a""b"`, so a name holding two delimiters silently loses
+/// one and cannot be expressed at all.
+///
+/// prqlc always holds unescaped names — the lexer takes the body of a
+/// backtick-quoted ident verbatim — so it knows which of sqlparser's two modes
+/// applies and must say so rather than leave the routine to guess. Doubling
+/// every delimiter puts the value in sqlparser's "no-escape" mode, where the
+/// value carries the escaped body and `escape_quoted_string` is the identity;
+/// `test_quoted_ident_round_trips` pins that the composition stays injective.
+fn quoted_ident(ident: String, quote: char) -> sql_ast::Ident {
+    let mut escaped = String::with_capacity(ident.len());
+    for c in ident.chars() {
+        if c == quote {
+            escaped.push(quote);
+        }
+        escaped.push(c);
+    }
+    sql_ast::Ident::with_quote(quote, escaped)
 }
 
 pub(super) fn translate_operand(
@@ -1207,6 +1242,61 @@ mod test {
     use insta::assert_yaml_snapshot;
 
     use super::*;
+
+    /// Decode a quoted SQL identifier back into the name it denotes, the way a
+    /// database would: the delimiters are stripped and a doubled delimiter
+    /// stands for one literal delimiter character.
+    fn decode_quoted_ident(sql: &str, quote: char) -> String {
+        let inner = sql
+            .strip_prefix(quote)
+            .and_then(|s| s.strip_suffix(quote))
+            .expect("not a quoted identifier");
+
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == quote {
+                assert_eq!(
+                    chars.next(),
+                    Some(quote),
+                    "lone delimiter inside a quoted identifier: {sql}"
+                );
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// Rendering a name into a quoted SQL identifier must be injective: the name
+    /// has to be recoverable from the SQL, so two distinct names can never
+    /// render the same.
+    #[test]
+    fn test_quoted_ident_round_trips() {
+        let names = [
+            "plain", r#"a"b"#, r#"a""b"#, r#"a"""b"#, r#"""#, r#""""#, r#"a""#, r#""a"#, r#"a\"b"#,
+            r#"a\b"#, "a`b", "a b", "",
+        ];
+
+        for quote in ['"', '`'] {
+            let mut rendered = Vec::new();
+            for name in names {
+                let sql = quoted_ident(name.to_string(), quote).to_string();
+                assert_eq!(
+                    decode_quoted_ident(&sql, quote),
+                    name,
+                    "{name:?} did not survive being rendered as {sql}"
+                );
+                rendered.push(sql);
+            }
+
+            let distinct: std::collections::HashSet<_> = rendered.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                rendered.len(),
+                "two distinct names rendered to the same SQL identifier: {rendered:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_range_of_ranges() -> Result<()> {
