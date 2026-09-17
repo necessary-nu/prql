@@ -94,6 +94,16 @@ struct QueryOpts {
     /// When false, * are not allowed.
     pub allow_stars: bool,
 
+    /// True when a `*` in this position stands for the whole row rather than
+    /// for a projection.
+    ///
+    /// SQL has no bare `*` *expression*: `DISTINCT ON (*)`, `GROUP BY *` and
+    /// `PARTITION BY *` are all syntax errors. A whole row is spelled as a
+    /// qualified reference instead (`cake.*`), so in those positions the table
+    /// prefix that [`QueryOpts::omit_ident_prefix`] would otherwise drop is
+    /// load-bearing and is kept regardless of how many relations the query has.
+    pub qualify_stars: bool,
+
     /// True when translating function that will have an OVER clause.
     pub window_function: bool,
 }
@@ -105,6 +115,7 @@ impl Default for QueryOpts {
             pre_projection: false,
             allow_ctes: true,
             allow_stars: true,
+            qualify_stars: false,
             window_function: false,
         }
     }

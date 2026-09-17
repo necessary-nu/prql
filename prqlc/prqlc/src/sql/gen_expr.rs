@@ -655,14 +655,15 @@ pub(super) fn translate_cid(cid: rq::CId, ctx: &mut Context) -> Result<ExprOrSou
                 }
             }
             ColumnDecl::RelationColumn(riid, _, col) => {
-                let column = match col.clone() {
-                    rq::RelationColumn::Wildcard => translate_star(ctx, None)?,
-                    rq::RelationColumn::Single(name) => name.unwrap(),
-                };
                 let t = &ctx.anchor.relation_instances[riid];
-
                 let table_ident = t.table_ref.name.clone().map(Ident::from_name);
-                let ident = translate_ident(table_ident, Some(column), ctx);
+
+                let ident = match col.clone() {
+                    rq::RelationColumn::Wildcard => translate_star_ident(table_ident, ctx, None)?,
+                    rq::RelationColumn::Single(name) => {
+                        translate_ident(table_ident, Some(name.unwrap()), ctx)
+                    }
+                };
                 sql_ast::Expr::CompoundIdentifier(ident).into()
             }
         })
@@ -677,9 +678,9 @@ pub(super) fn translate_cid(cid: rq::CId, ctx: &mut Context) -> Result<ExprOrSou
             None
         };
 
-        let column = match &column_decl {
+        let ident = match &column_decl {
             ColumnDecl::RelationColumn(_, _, rq::RelationColumn::Wildcard) => {
-                translate_star(ctx, None)?
+                translate_star_ident(table_name.map(Ident::from_name), ctx, None)?
             }
 
             _ => {
@@ -687,16 +688,16 @@ pub(super) fn translate_cid(cid: rq::CId, ctx: &mut Context) -> Result<ExprOrSou
                 // pipeline was anchored (see `pq::gen_query::ensure_names`). Reaching here
                 // means the anchoring missed a reference, which is a compiler bug rather
                 // than anything the user can act on — but it should not abort the process.
-                ctx.anchor.column_names.get(&cid).cloned().ok_or_else(|| {
+                let column = ctx.anchor.column_names.get(&cid).cloned().ok_or_else(|| {
                     Error::new_assert(format!(
                         "no name assigned to {cid:?} ({}) before SQL generation",
                         column_decl.as_ref()
                     ))
-                })?
+                })?;
+
+                translate_ident(table_name.map(Ident::from_name), Some(column), ctx)
             }
         };
-
-        let ident = translate_ident(table_name.map(Ident::from_name), Some(column), ctx);
 
         log::debug!("translating {cid:?} post projection: {ident:?}");
 
@@ -714,6 +715,46 @@ pub(super) fn translate_star(ctx: &Context, span: Option<Span>) -> Result<String
     } else {
         Ok("*".to_string())
     }
+}
+
+/// Render a wildcard as an identifier.
+///
+/// In a projection a wildcard is the bare `*` of a select list. In a key
+/// position — the `DISTINCT ON` list, the `ORDER BY` that
+/// [`crate::sql::pq::preprocess::distinct`] derives from it, and a window's
+/// `PARTITION BY` — it stands for the whole row instead, and there SQL has no
+/// bare `*`: PostgreSQL answers `DISTINCT ON (*)` with
+/// `syntax error at or near "*"`. The spellable form is a qualified whole-row
+/// reference, `cake.*`, so in those positions the table prefix is kept even when
+/// `QueryOpts::omit_ident_prefix` (which is only set to make single-relation
+/// queries read better) would drop it.
+///
+/// Callers opt in through `QueryOpts::qualify_stars`; a projection does not, so
+/// `SELECT *` is unaffected.
+pub(super) fn translate_star_ident(
+    table_ident: Option<pl::Ident>,
+    ctx: &Context,
+    span: Option<Span>,
+) -> Result<Vec<sql_ast::Ident>> {
+    let star = translate_star(ctx, span)?;
+
+    if !ctx.query.qualify_stars {
+        return Ok(translate_ident(table_ident, Some(star), ctx));
+    }
+
+    // A whole-row reference has to name the relation it refers to; an anonymous
+    // relation has no spelling here at all, so say so rather than emit a bare
+    // `*` the database will reject.
+    let table_ident = table_ident.ok_or_else(|| {
+        Error::new_simple("Cannot refer to all columns of an unnamed relation in this position.")
+            .with_span(span)
+    })?;
+
+    Ok(table_ident
+        .into_iter()
+        .chain(std::iter::once(star))
+        .map(|part| translate_ident_part(part, ctx))
+        .collect())
 }
 
 pub(super) fn translate_sstring(
@@ -875,9 +916,16 @@ fn translate_windowed(
         });
     }
 
+    // `PARTITION BY` is a key position: a wildcard partition (which
+    // `pq::preprocess::create_filter_by_row_number` produces for
+    // `group this (take n)`) must be a qualified whole-row reference.
+    let prev_qualify_stars = std::mem::replace(&mut ctx.query.qualify_stars, true);
+    let partition_by = try_into_exprs(window.partition, ctx, span);
+    ctx.query.qualify_stars = prev_qualify_stars;
+
     let window = WindowSpec {
         window_name: None,
-        partition_by: try_into_exprs(window.partition, ctx, span)?,
+        partition_by: partition_by?,
         order_by,
         window_frame: if supports_frame && window.frame != default_frame {
             Some(try_into_window_frame(window.frame)?)

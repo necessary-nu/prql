@@ -3319,6 +3319,194 @@ fn test_distinct_on_04() {
     ");
 }
 
+/// `group this (take 1)` over a relation whose projection is still a wildcard
+/// deduplicates on the whole row. That key is spelled `cake.*`, never a bare
+/// `*`: PostgreSQL answers `DISTINCT ON (*)` with `syntax error at or near "*"`
+/// (SQLSTATE 42601). The prefix is kept even though the query has a single
+/// relation and `omit_ident_prefix` would otherwise drop it.
+///
+/// The four tests below fuse a later stage into the deduplication, which is what
+/// makes the key differ from the frame and so selects `DISTINCT ON` over plain
+/// `SELECT DISTINCT`.
+#[test]
+fn test_distinct_on_star_key_select() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group this (take 1)
+    select {name}
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (name, cake.*) name
+    FROM
+      cake
+    ");
+}
+
+#[test]
+fn test_distinct_on_star_key_derive() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group this (take 1)
+    derive {one = 1}
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        DISTINCT ON (cake.*) *
+      FROM
+        cake
+    )
+    SELECT
+      *,
+      1 AS one
+    FROM
+      table_0
+    ");
+}
+
+#[test]
+fn test_distinct_on_star_key_join() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group this (take 1)
+    join fruit (fruit.id == cake.id)
+    select {cake.name, fruit.name}
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        DISTINCT ON (id, name, cake.*) name,
+        id
+      FROM
+        cake
+    )
+    SELECT
+      table_0.name,
+      fruit.name
+    FROM
+      table_0
+      INNER JOIN fruit ON fruit.id = table_0.id
+    ");
+}
+
+#[test]
+fn test_distinct_on_star_key_aggregate() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group this (take 1)
+    aggregate {n = count this}
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        DISTINCT ON (cake.*) *
+      FROM
+        cake
+    )
+    SELECT
+      COUNT(*) AS n
+    FROM
+      table_0
+    ");
+}
+
+/// With two relations in the query the star was already qualified, because
+/// `omit_ident_prefix` is only set for a single one. This case was correct
+/// before the fix and must stay put.
+#[test]
+fn test_distinct_on_star_key_multiple_relations() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    join fruit (fruit.id == cake.id)
+    group this (take 1)
+    select {cake.name}
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (cake.id, cake.name, cake.*, fruit.id, fruit.*) cake.name
+    FROM
+      cake
+      INNER JOIN fruit ON fruit.id = cake.id
+    ");
+}
+
+/// With nothing fused in, the key and the frame agree and the deduplication is
+/// spelled `SELECT DISTINCT *`, where a bare star is the projection and is
+/// legal. Qualifying stars in key positions must not reach the projection.
+#[test]
+fn test_distinct_star_alone_stays_unqualified() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group this (take 1)
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT *
+    FROM
+      cake
+    ");
+}
+
+/// A key holding no wildcard is untouched: these columns are ordinary
+/// references and keep dropping their prefix in a single-relation query.
+#[test]
+fn test_distinct_on_non_star_key_unchanged() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    select {name}
+    group this (take 1)
+    derive {one = 1}
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        DISTINCT ON (name) name
+      FROM
+        cake
+    )
+    SELECT
+      name,
+      1 AS one
+    FROM
+      table_0
+    ");
+}
+
+/// Taking more than one row per group renders the partition as a window
+/// function instead, and `PARTITION BY` is a key position for the same reason:
+/// `PARTITION BY *` is 42601, `PARTITION BY cake.*` is a whole-row reference.
+#[test]
+fn test_row_number_star_partition() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group this (take 2)
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        *,
+        ROW_NUMBER() OVER (PARTITION BY cake.*) AS _expr_0
+      FROM
+        cake
+    )
+    SELECT
+      *
+    FROM
+      table_0
+    WHERE
+      _expr_0 <= 2
+    ");
+}
+
 #[test]
 fn test_group_take_n_01() {
     assert_snapshot!((compile(r###"

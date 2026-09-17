@@ -36,7 +36,7 @@ pub(super) fn try_into_exprs(
         let t = &ctx.anchor.relation_instances[riid];
         let table_name = t.table_ref.name.clone().map(Ident::from_name);
 
-        let ident = translate_star(ctx, span)?;
+        let ident = translate_star_ident(table_name, ctx, span)?;
         if let Some(excluded) = excluded.get(&cid) {
             if !excluded.is_empty() {
                 return Err(
@@ -45,7 +45,6 @@ pub(super) fn try_into_exprs(
                 );
             }
         }
-        let ident = translate_ident(table_name, Some(ident), ctx);
 
         res.push(sql_ast::Expr::CompoundIdentifier(ident));
     }
