@@ -79,6 +79,9 @@ fn translate_select_pipeline(
     ctx.push_query();
     ctx.query.omit_ident_prefix = table_count == 1;
     ctx.query.pre_projection = true;
+    // `push_query` inherits the parent's options; whether a star is a key is a
+    // property of the position being rendered, never of an enclosing query.
+    ctx.query.qualify_stars = false;
 
     let mut from: Vec<_> = pipeline
         .pluck(|t| t.into_from())
@@ -119,15 +122,20 @@ fn translate_select_pipeline(
     let distinct = if is_distinct {
         Some(sql_ast::Distinct::Distinct)
     } else if !distinct_ons.is_empty() {
-        Some(sql_ast::Distinct::On(
-            distinct_ons
-                .into_iter()
-                .exactly_one()
-                .unwrap()
-                .into_iter()
-                .map(|id| translate_cid(id, ctx).map(|x| x.into_ast()))
-                .collect::<Result<Vec<_>>>()?,
-        ))
+        // The key of a `DISTINCT ON` is a list of expressions, and a wildcard in
+        // it means the whole row — which has to be spelled `cake.*`, never a
+        // bare `*`.
+        ctx.query.qualify_stars = true;
+        let on = distinct_ons
+            .into_iter()
+            .exactly_one()
+            .unwrap()
+            .into_iter()
+            .map(|id| translate_cid(id, ctx).map(|x| x.into_ast()))
+            .collect::<Result<Vec<_>>>();
+        ctx.query.qualify_stars = false;
+
+        Some(sql_ast::Distinct::On(on?))
     } else {
         None
     };
@@ -161,6 +169,11 @@ fn translate_select_pipeline(
     // GROUP BY
     let aggregate = after_agg.pluck(|t| t.into_aggregate()).into_iter().next();
     let group_by: Vec<CId> = aggregate.map(|(part, _)| part).unwrap_or_default();
+    // Not a `qualify_stars` position, despite `GROUP BY` being a key: PostgreSQL
+    // does not propagate the functional dependency from a whole-row var to its
+    // columns, so `SELECT * ... GROUP BY cake.*` is rejected just as
+    // `GROUP BY *` is. Grouping by a wildcard needs the wildcard expanded, which
+    // is precisely what a wildcard says we cannot do — a separate defect.
     ctx.query.allow_stars = ctx.dialect.stars_in_group();
     let group_by = sql_ast::GroupByExpr::Expressions(try_into_exprs(group_by, ctx, None)?, vec![]);
     ctx.query.allow_stars = true;
@@ -187,8 +200,13 @@ fn translate_select_pipeline(
         })
     };
 
-    // Use sorting from the frame
-    let mut order_by: Vec<sql_ast::OrderByExpr> = order_by
+    // Use sorting from the frame.
+    //
+    // `pq::preprocess::distinct` prepends the `DISTINCT ON` key to this sort,
+    // and PostgreSQL requires the two to agree, so a wildcard reaching here is
+    // the same whole-row key and is qualified the same way.
+    ctx.query.qualify_stars = true;
+    let sorted: Result<Option<Vec<sql_ast::OrderByExpr>>> = order_by
         .last()
         .map(|sorts| {
             sorts
@@ -196,8 +214,9 @@ fn translate_select_pipeline(
                 .map(|s| translate_column_sort(s, ctx))
                 .try_collect()
         })
-        .transpose()?
-        .unwrap_or_default();
+        .transpose();
+    ctx.query.qualify_stars = false;
+    let mut order_by: Vec<sql_ast::OrderByExpr> = sorted?.unwrap_or_default();
 
     let (fetch, limit) = if ctx.dialect.use_fetch() {
         (limit.map(|l| fetch_of_i64(l, ctx)), None)
