@@ -14,8 +14,10 @@ use super::gen_expr::*;
 use super::gen_projection::*;
 use super::operators::translate_operator;
 use super::pq::ast::{Cte, CteKind, RelationExpr, RelationExprKind, SqlRelation, SqlTransform};
+use super::pq::context::ColumnDecl;
 use super::{Context, Dialect};
 use crate::debug;
+use crate::ir::generic::ColumnSort;
 use crate::ir::pl::{JoinSide, Literal};
 use crate::ir::rq::{new_binop, CId, Expr, ExprKind, RelationLiteral, RelationalQuery};
 use crate::utils::{BreakUp, Pluck};
@@ -223,12 +225,7 @@ fn translate_select_pipeline(
     ctx.query.qualify_stars = true;
     let sorted: Result<Option<Vec<sql_ast::OrderByExpr>>> = order_by
         .last()
-        .map(|sorts| {
-            sorts
-                .iter()
-                .map(|s| translate_column_sort(s, ctx))
-                .try_collect()
-        })
+        .map(|sorts| translate_order_by(sorts, &selected, ctx))
         .transpose();
     ctx.query.qualify_stars = false;
     let mut order_by: Vec<sql_ast::OrderByExpr> = sorted?.unwrap_or_default();
@@ -305,6 +302,49 @@ fn translate_select_pipeline(
             ..default_select()
         })))
     })
+}
+
+/// Translate the `ORDER BY` of a SELECT whose projection holds `projected`.
+///
+/// `ORDER BY` is rendered after the projection, so a column is referred to by the
+/// name the projection gives it. A computed column the projection does not carry
+/// has no such name. That happens under `DISTINCT ON`, whose `ORDER BY`
+/// [`super::pq::preprocess::distinct`] derives from the group's key and sort,
+/// inside the same SELECT as a final projection that may drop both:
+/// `SELECT DISTINCT ON (id + 1) name, id ... ORDER BY _expr_0, id` fails with
+/// 42703.
+///
+/// So such a column is written as its expression instead, the way the
+/// `DISTINCT ON` list already writes it. PostgreSQL and DuckDB both take an
+/// `ORDER BY` expression under `DISTINCT ON` whether or not it is selected, and
+/// PostgreSQL matches it against the `DISTINCT ON` key by expression. A literal is
+/// left out instead: it cannot change the order, and written out it would be
+/// read as an output-column position (see `AnchorContext::is_literal`).
+fn translate_order_by(
+    sorts: &[ColumnSort<CId>],
+    projected: &[CId],
+    ctx: &mut Context,
+) -> Result<Vec<sql_ast::OrderByExpr>> {
+    let mut res = Vec::with_capacity(sorts.len());
+    for sort in sorts {
+        let is_compute = matches!(
+            ctx.anchor.column_decls.get(&sort.column),
+            Some(ColumnDecl::Compute(_))
+        );
+        if !is_compute || projected.contains(&sort.column) {
+            res.push(translate_column_sort(sort, ctx)?);
+            continue;
+        }
+        if ctx.anchor.is_literal(sort.column) {
+            continue;
+        }
+
+        let prev_pre_projection = std::mem::replace(&mut ctx.query.pre_projection, true);
+        let sort = translate_column_sort(sort, ctx);
+        ctx.query.pre_projection = prev_pre_projection;
+        res.push(sort?);
+    }
+    Ok(res)
 }
 
 /// Whether a wildcard in the `GROUP BY` key has to be written as a whole-row

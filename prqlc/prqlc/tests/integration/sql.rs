@@ -3987,6 +3987,126 @@ fn test_group_take_only_literal_keys() {
     ");
 }
 
+/// `DISTINCT ON` and the `ORDER BY` derived from its key share one SELECT with
+/// the final projection. When that projection drops a computed key, the
+/// `ORDER BY` cannot name it: `ORDER BY _expr_0` was 42703, "column does not
+/// exist". The key is written as its expression instead, as the `DISTINCT ON`
+/// list already writes it. PostgreSQL takes an `ORDER BY` expression under
+/// `DISTINCT ON` whether or not it is selected, and matches it to the key.
+///
+/// A key the projection keeps is still ordered by its name.
+#[test]
+fn test_distinct_on_unprojected_key() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {x = id + 1}
+    group {x} (sort id | take 1)
+    select {name, id}
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (id + 1) name,
+      id
+    FROM
+      cake
+    ORDER BY
+      id + 1,
+      id
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {x = id + 1}
+    group {x, name} (sort {-id} | take 1)
+    select {id}
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (id + 1, name) id
+    FROM
+      cake
+    ORDER BY
+      id + 1,
+      name,
+      id DESC
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {x = id + 1}
+    group {x} (sort id | take 1)
+    select {name, x}
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (id + 1) name,
+      id + 1 AS x
+    FROM
+      cake
+    ORDER BY
+      x,
+      id
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.duckdb
+
+    from cake
+    derive {x = id + 1}
+    group {x} (sort id | take 1)
+    select {name, id}
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (id + 1) name,
+      id
+    FROM
+      cake
+    ORDER BY
+      id + 1,
+      id
+    ");
+}
+
+/// The group's own sort lands in the same `ORDER BY`, and a computed sort key
+/// the projection drops is written as its expression too. A literal sort key is
+/// left out rather than written: it cannot change the order, and `ORDER BY 5`
+/// would name the fifth output column.
+#[test]
+fn test_distinct_on_unprojected_sort() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group {name} (sort {id * -1} | take 1)
+    select {name}
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (name) name
+    FROM
+      cake
+    ORDER BY
+      name,
+      id * -1
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group {name} (sort {5} | take 1)
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (name) *
+    FROM
+      cake
+    ORDER BY
+      name
+    ");
+}
+
 #[test]
 fn test_group_take_n_01() {
     assert_snapshot!((compile(r###"
