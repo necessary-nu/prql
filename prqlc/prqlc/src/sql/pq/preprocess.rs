@@ -155,10 +155,33 @@ pub(in crate::sql) fn distinct(
                 let columns_in_frame = ctx.anchor.determine_select_columns(&pipeline.clone());
                 let matching_columns = vecs_contain_same_elements(&columns_in_frame, &partition);
 
+                // A literal key partitions nothing. Written into `DISTINCT ON`,
+                // PostgreSQL and DuckDB read it as an output-column position or
+                // reject it, and MySQL rejects it in the `PARTITION BY` of the
+                // row-number fallback (see `AnchorContext::is_literal`). Only the
+                // DISTINCT test above compares the partition against the frame,
+                // and a literal can be part of the frame, so it sees the full key.
+                let partition = partition
+                    .into_iter()
+                    .filter(|cid| !ctx.anchor.is_literal(*cid))
+                    .collect_vec();
+
                 if take_only_first && sort.is_empty() && matching_columns {
                     // DISTINCT
 
                     res.push(SqlTransform::Distinct);
+                } else if partition.is_empty() {
+                    // Every key was a literal, so there is one group: take from the
+                    // whole relation, spelled the way `sort | take` lowers. The
+                    // group's sort decides which rows; with none, the empty sort
+                    // still drops any earlier ordering, which a group does not
+                    // inherit, as the `DISTINCT ON` branch below does.
+                    res.push(Super(Sort(sort.clone())));
+                    res.push(Super(Take(rq::Take {
+                        range,
+                        partition,
+                        sort,
+                    })));
                 } else if ctx.dialect.supports_distinct_on() && range_int.end == Some(1) {
                     // DISTINCT ON (only if we want to select only one row per group)
 

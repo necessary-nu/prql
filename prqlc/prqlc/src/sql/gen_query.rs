@@ -17,7 +17,7 @@ use super::pq::ast::{Cte, CteKind, RelationExpr, RelationExprKind, SqlRelation, 
 use super::{Context, Dialect};
 use crate::debug;
 use crate::ir::pl::{JoinSide, Literal};
-use crate::ir::rq::{CId, Expr, ExprKind, RelationLiteral, RelationalQuery};
+use crate::ir::rq::{new_binop, CId, Expr, ExprKind, RelationLiteral, RelationalQuery};
 use crate::utils::{BreakUp, Pluck};
 use crate::{Error, Result, WithErrorInfo};
 use prqlc_parser::generic::InterpolateItem;
@@ -163,13 +163,31 @@ fn translate_select_pipeline(
     let (mut before_agg, mut after_agg) =
         pipeline.break_up(|t| matches!(t, Transform::Aggregate { .. } | Transform::Union { .. }));
 
-    // WHERE and HAVING
-    let where_ = filter_of_conditions(before_agg.pluck(|t| t.into_filter()), ctx)?;
-    let having = filter_of_conditions(after_agg.pluck(|t| t.into_filter()), ctx)?;
-
     // GROUP BY
     let aggregate = after_agg.pluck(|t| t.into_aggregate()).into_iter().next();
     let group_by: Vec<CId> = aggregate.map(|(part, _)| part).unwrap_or_default();
+
+    // A literal key never changes the grouping, and written into `GROUP BY` it
+    // is read as an output-column position or rejected (see
+    // `AnchorContext::is_literal`), so it is left out. The select list may still
+    // project it: a constant needs no grouping.
+    let (literal_keys, group_by): (Vec<CId>, Vec<CId>) = group_by
+        .into_iter()
+        .partition(|cid| ctx.anchor.is_literal(*cid));
+    let mut having_conditions = after_agg.pluck(|t| t.into_filter());
+    if group_by.is_empty() && !literal_keys.is_empty() {
+        // Every key was a literal. That is still one group per non-empty input
+        // and none for an empty one, whereas dropping `GROUP BY` altogether
+        // would aggregate an empty input into one row. `HAVING` without
+        // `GROUP BY` treats the input as a single group, which the condition
+        // then discards when it is empty.
+        having_conditions.insert(0, has_rows());
+    }
+
+    // WHERE and HAVING
+    let where_ = filter_of_conditions(before_agg.pluck(|t| t.into_filter()), ctx)?;
+    let having = filter_of_conditions(having_conditions, ctx)?;
+
     ctx.query.qualify_stars = group_by_whole_row(&group_by, &selected, ctx)?;
     let group_by = try_into_exprs(group_by, ctx, None);
     ctx.query.qualify_stars = false;
@@ -674,6 +692,25 @@ fn filter_of_conditions(exprs: Vec<Expr>, context: &mut Context) -> Result<Optio
     } else {
         None
     })
+}
+
+/// `COUNT(*) > 0`, spelled the way `count this` lowers.
+fn has_rows() -> Expr {
+    let count = Expr {
+        kind: ExprKind::Operator {
+            name: "std.count".to_string(),
+            args: vec![Expr {
+                kind: ExprKind::Literal(Literal::Null),
+                span: None,
+            }],
+        },
+        span: None,
+    };
+    let zero = Expr {
+        kind: ExprKind::Literal(Literal::Integer(0)),
+        span: None,
+    };
+    new_binop(count, "std.gt", zero)
 }
 
 fn all(mut exprs: Vec<Expr>) -> Option<Expr> {

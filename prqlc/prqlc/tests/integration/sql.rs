@@ -3727,6 +3727,266 @@ fn test_group_by_star_duckdb() {
     ");
 }
 
+/// A literal key never changes a grouping, and written into `GROUP BY` as a
+/// bare literal it is not a constant at all: PostgreSQL reads an integer as the
+/// position of an output column (`GROUP BY id, name, 5` is 42P10, "GROUP BY
+/// position 5 is not in select list") and rejects every other literal (42601,
+/// "non-integer constant in GROUP BY"). So it is left out of `GROUP BY`, while
+/// the select list still projects it: a constant needs no grouping.
+///
+/// A negation of a literal counts, because PostgreSQL folds `-5` into the
+/// literal, and so does a rename of one.
+#[test]
+fn test_group_by_literal_key() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    select {id, name}
+    derive {x = 5}
+    group this (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      id,
+      name,
+      5 AS x,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      id,
+      name
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {a = 5, k = "k", z = null}
+    derive {x = -a}
+    group {name, x, k, z} (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      name,
+      -5 AS x,
+      'k' AS k,
+      NULL AS z,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      name
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {x = 5}
+    group {name, x} (aggregate {n = count this})
+    select {name, n}
+    "###).unwrap()), @"
+    SELECT
+      name,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      name
+    ");
+}
+
+/// SQLite and MySQL read an integer literal in `GROUP BY` as a position too, so
+/// leaving literal keys out is not specific to PostgreSQL.
+#[test]
+fn test_group_by_literal_key_other_dialects() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.sqlite
+
+    from cake
+    derive {x = 5}
+    group {name, x} (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      name,
+      5 AS x,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      name
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.mysql
+
+    from cake
+    derive {x = 5}
+    group {name, x} (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      name,
+      5 AS x,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      name
+    ");
+}
+
+/// When every key is a literal there is still one group per non-empty input and
+/// none for an empty one. Dropping `GROUP BY` alone would aggregate an empty
+/// input into a single row, so the query keeps a `HAVING`, which without
+/// `GROUP BY` treats the input as one group and discards it when it is empty.
+#[test]
+fn test_group_by_only_literal_keys() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group {k = "all"} (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      'all' AS k,
+      COUNT(*) AS n
+    FROM
+      cake
+    HAVING
+      COUNT(*) > 0
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    filter id > 1
+    group {k = "all"} (aggregate {n = count this})
+    filter n > 3 || n < 1
+    "###).unwrap()), @"
+    SELECT
+      'all' AS k,
+      COUNT(*) AS n
+    FROM
+      cake
+    WHERE
+      id > 1
+    HAVING
+      COUNT(*) > 0
+      AND (
+        COUNT(*) > 3
+        OR COUNT(*) < 1
+      )
+    ");
+}
+
+/// `DISTINCT ON` reads an integer literal as a position as well, in PostgreSQL
+/// and DuckDB, so a literal key is left out of the take's partition. The
+/// `ORDER BY` that has to agree with the `DISTINCT ON` key is derived from the
+/// same partition, so it loses the literal too.
+#[test]
+fn test_distinct_on_literal_key() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {x = 5}
+    group {x, name} (sort id | take 1)
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (name) 5 AS x,
+      *
+    FROM
+      cake
+    ORDER BY
+      name,
+      id
+    ");
+}
+
+/// A take grouped by nothing but literals is a take from the whole relation:
+/// the group's sort picks the rows, and an earlier sort does not, since a group
+/// resets order.
+///
+/// PostgreSQL resolves the keys of a window's `PARTITION BY` as expressions, not
+/// positions, so a literal there is legal and is left alone.
+#[test]
+fn test_group_take_only_literal_keys() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {x = 5}
+    group {x} (sort id | take 1)
+    select {name, id}
+    "###).unwrap()), @"
+    SELECT
+      name,
+      id
+    FROM
+      cake
+    ORDER BY
+      id
+    LIMIT
+      1
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    sort name
+    derive {x = 5}
+    group {x} (take 2..3)
+    "###).unwrap()), @"
+    SELECT
+      5 AS x,
+      *
+    FROM
+      cake
+    LIMIT
+      2 OFFSET 1
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {x = 5}
+    group {x, name} (take 2)
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        5 AS x,
+        *,
+        ROW_NUMBER() OVER (PARTITION BY name) AS _expr_0
+      FROM
+        cake
+    )
+    SELECT
+      *
+    FROM
+      table_0
+    WHERE
+      _expr_0 <= 2
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    derive {x = 5}
+    group {x} (derive {r = row_number this})
+    "###).unwrap()), @"
+    SELECT
+      5 AS x,
+      *,
+      ROW_NUMBER() OVER (PARTITION BY 5) AS r
+    FROM
+      cake
+    ");
+}
+
 #[test]
 fn test_group_take_n_01() {
     assert_snapshot!((compile(r###"

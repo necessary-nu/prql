@@ -10,8 +10,8 @@ use serde::Serialize;
 use super::ast::{SqlRelation, SqlTransform};
 use crate::ir::pl::Ident;
 use crate::ir::rq::{
-    fold_table, CId, Compute, Relation, RelationColumn, RelationKind, RelationalQuery, RqFold, TId,
-    TableDecl, TableRef, Transform,
+    fold_table, CId, Compute, Expr, ExprKind, Relation, RelationColumn, RelationKind,
+    RelationalQuery, RqFold, TId, TableDecl, TableRef, Transform,
 };
 use crate::sql::pq::positional_mapping::PositionalMapper;
 use crate::utils::{IdGenerator, NameGenerator};
@@ -231,6 +231,39 @@ impl AnchorContext {
             }
         } else {
             Vec::new()
+        }
+    }
+
+    /// True when the column is a literal: a constant written out in the SQL as a
+    /// bare token such as `5`, `-5`, `'k'`, `true` or `NULL`.
+    ///
+    /// Such a column never distinguishes one row from another, so as a key it
+    /// partitions nothing. Written into a key it is harmful. PostgreSQL, SQLite,
+    /// DuckDB and MySQL all read an integer literal in `GROUP BY` or `ORDER BY`
+    /// as the position of an output column, and PostgreSQL and DuckDB do the
+    /// same in `DISTINCT ON`. PostgreSQL rejects any other literal in those
+    /// positions.
+    ///
+    /// Follows renames (`derive {y = x}`) and negation, which PostgreSQL, SQLite
+    /// and DuckDB fold into the literal (`-5`).
+    pub(crate) fn is_literal(&self, cid: CId) -> bool {
+        let Some(ColumnDecl::Compute(compute)) = self.column_decls.get(&cid) else {
+            return false;
+        };
+        if compute.window.is_some() || compute.is_aggregation {
+            return false;
+        }
+        self.is_literal_expr(&compute.expr)
+    }
+
+    fn is_literal_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Literal(_) => true,
+            ExprKind::ColumnRef(cid) => self.is_literal(*cid),
+            ExprKind::Operator { name, args } if name == "std.neg" => {
+                matches!(args.as_slice(), [arg] if self.is_literal_expr(arg))
+            }
+            _ => false,
         }
     }
 
