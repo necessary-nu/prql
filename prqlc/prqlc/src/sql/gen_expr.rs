@@ -706,28 +706,17 @@ pub(super) fn translate_cid(cid: rq::CId, ctx: &mut Context) -> Result<ExprOrSou
     }
 }
 
-pub(super) fn translate_star(ctx: &Context, span: Option<Span>) -> Result<String> {
-    if !ctx.query.allow_stars {
-        Err(
-            Error::new_simple("Target dialect does not support * in this position.")
-                .with_span(span),
-        )
-    } else {
-        Ok("*".to_string())
-    }
-}
-
 /// Render a wildcard as an identifier.
 ///
 /// In a projection a wildcard is the bare `*` of a select list. In a key
 /// position — the `DISTINCT ON` list, the `ORDER BY` that
-/// [`crate::sql::pq::preprocess::distinct`] derives from it, and a window's
-/// `PARTITION BY` — it stands for the whole row instead, and there SQL has no
-/// bare `*`: PostgreSQL answers `DISTINCT ON (*)` with
-/// `syntax error at or near "*"`. The spellable form is a qualified whole-row
-/// reference, `cake.*`, so in those positions the table prefix is kept even when
-/// `QueryOpts::omit_ident_prefix` (which is only set to make single-relation
-/// queries read better) would drop it.
+/// [`crate::sql::pq::preprocess::distinct`] derives from it, a window's
+/// `PARTITION BY`, and a `GROUP BY` where the dialect takes a whole-row key — it
+/// stands for the whole row instead, and there SQL has no bare `*`: PostgreSQL
+/// answers `DISTINCT ON (*)` with `syntax error at or near "*"`. The spellable
+/// form is a qualified whole-row reference, `cake.*`, so in those positions the
+/// table prefix is kept even when `QueryOpts::omit_ident_prefix` (which is only
+/// set to make single-relation queries read better) would drop it.
 ///
 /// Callers opt in through `QueryOpts::qualify_stars`; a projection does not, so
 /// `SELECT *` is unaffected.
@@ -736,7 +725,7 @@ pub(super) fn translate_star_ident(
     ctx: &Context,
     span: Option<Span>,
 ) -> Result<Vec<sql_ast::Ident>> {
-    let star = translate_star(ctx, span)?;
+    let star = "*".to_string();
 
     if !ctx.query.qualify_stars {
         return Ok(translate_ident(table_ident, Some(star), ctx));

@@ -9,6 +9,7 @@ use sqlparser::ast::{
     TableFactor, TableWithJoins,
 };
 
+use super::dialect::GroupByStar;
 use super::gen_expr::*;
 use super::gen_projection::*;
 use super::operators::translate_operator;
@@ -107,12 +108,12 @@ fn translate_select_pipeline(
         }
     }
 
-    let projection = pipeline
+    let selected = pipeline
         .pluck(|t| t.into_select())
         .into_iter()
         .exactly_one()
         .unwrap();
-    let projection = translate_wildcards(&ctx.anchor, projection);
+    let projection = translate_wildcards(&ctx.anchor, selected.clone());
     let mut projection = translate_select_items(projection.0, projection.1, ctx)?;
 
     let order_by = pipeline.pluck(|t| t.into_sort());
@@ -169,14 +170,10 @@ fn translate_select_pipeline(
     // GROUP BY
     let aggregate = after_agg.pluck(|t| t.into_aggregate()).into_iter().next();
     let group_by: Vec<CId> = aggregate.map(|(part, _)| part).unwrap_or_default();
-    // Not a `qualify_stars` position, despite `GROUP BY` being a key: PostgreSQL
-    // does not propagate the functional dependency from a whole-row var to its
-    // columns, so `SELECT * ... GROUP BY cake.*` is rejected just as
-    // `GROUP BY *` is. Grouping by a wildcard needs the wildcard expanded, which
-    // is precisely what a wildcard says we cannot do — a separate defect.
-    ctx.query.allow_stars = ctx.dialect.stars_in_group();
-    let group_by = sql_ast::GroupByExpr::Expressions(try_into_exprs(group_by, ctx, None)?, vec![]);
-    ctx.query.allow_stars = true;
+    ctx.query.qualify_stars = group_by_whole_row(&group_by, &selected, ctx)?;
+    let group_by = try_into_exprs(group_by, ctx, None);
+    ctx.query.qualify_stars = false;
+    let group_by = sql_ast::GroupByExpr::Expressions(group_by?, vec![]);
 
     ctx.query.pre_projection = false;
 
@@ -290,6 +287,55 @@ fn translate_select_pipeline(
             ..default_select()
         })))
     })
+}
+
+/// Whether a wildcard in the `GROUP BY` key has to be written as a whole-row
+/// reference, or an error if the dialect cannot write it at all.
+///
+/// A wildcard in the key means columns the compiler does not know. Every column
+/// it does know is already listed: lowering expands `this` or `cake.*` into the
+/// relation's columns, and only the unknown remainder stays a wildcard. So there
+/// is nothing more to expand here, and how the query can be written is up to the
+/// dialect.
+///
+/// PostgreSQL rejects a bare `GROUP BY *` (42601). It accepts the whole-row
+/// `GROUP BY cake.*`, but does not carry the functional dependency from that
+/// whole-row value to the row's columns, so `SELECT * ... GROUP BY cake.*` fails
+/// too (42803). The whole-row key is therefore only usable when the star is not
+/// also selected, as when only aggregates survive the grouping.
+fn group_by_whole_row(group_by: &[CId], selected: &[CId], ctx: &Context) -> Result<bool> {
+    if !ctx.anchor.contains_wildcard(group_by) {
+        return Ok(false);
+    }
+
+    let unsupported = |what: &str| {
+        Error::new_simple(format!(
+            "The dialect {:?} does not support {what}",
+            ctx.dialect
+        ))
+        .push_hint(
+            "providing more column information will allow the query to group by each column.",
+        )
+    };
+
+    match ctx.dialect.group_by_star() {
+        GroupByStar::Bare => Ok(false),
+        GroupByStar::WholeRow => {
+            let star_selected = group_by.iter().any(|cid| {
+                selected.contains(cid) && ctx.anchor.contains_wildcard(std::slice::from_ref(cid))
+            });
+            if star_selected {
+                Err(unsupported(
+                    "selecting all columns of a relation whose columns are unknown when grouping by them",
+                ))
+            } else {
+                Ok(true)
+            }
+        }
+        GroupByStar::Unsupported => Err(unsupported(
+            "grouping by all columns of a relation whose columns are unknown",
+        )),
+    }
 }
 
 fn translate_set_ops_pipeline(

@@ -91,9 +91,6 @@ struct QueryOpts {
     /// When false, queries will contain nested sub-queries instead of WITH CTEs.
     pub allow_ctes: bool,
 
-    /// When false, * are not allowed.
-    pub allow_stars: bool,
-
     /// True when a `*` in this position stands for the whole row rather than
     /// for a projection.
     ///
@@ -102,6 +99,10 @@ struct QueryOpts {
     /// qualified reference instead (`cake.*`), so in those positions the table
     /// prefix that [`QueryOpts::omit_ident_prefix`] would otherwise drop is
     /// load-bearing and is kept regardless of how many relations the query has.
+    ///
+    /// `GROUP BY` is such a position only where the dialect groups by a whole
+    /// row and the row's columns are not also selected; see
+    /// `gen_query::group_by_whole_row`.
     pub qualify_stars: bool,
 
     /// True when translating function that will have an OVER clause.
@@ -114,7 +115,6 @@ impl Default for QueryOpts {
             omit_ident_prefix: false,
             pre_projection: false,
             allow_ctes: true,
-            allow_stars: true,
             qualify_stars: false,
             window_function: false,
         }

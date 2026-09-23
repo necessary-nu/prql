@@ -3507,6 +3507,226 @@ fn test_row_number_star_partition() {
     ");
 }
 
+/// `GROUP BY` is the third key position a wildcard reaches. A wildcard only
+/// gets this far when the relation's columns are unknown, so there is nothing to
+/// list in its place, and PostgreSQL takes neither spelling of it while the
+/// grouped columns are also selected: `GROUP BY *` is 42601, and
+/// `SELECT * ... GROUP BY cake.*` is 42803 because the functional dependency is
+/// not carried from a whole-row var to its columns. So the query is refused.
+///
+/// With two relations the stars were already qualified and came out as
+/// `GROUP BY cake.*, fruit.*`, failing 42803 the same way. Knowing one side's
+/// columns does not help: the other side's star is still selected.
+#[test]
+fn test_group_by_star_selected() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group this (aggregate {n = count this})
+    "###).unwrap_err()), @"
+    Error: The dialect PostgresDialect does not support selecting all columns of a relation whose columns are unknown when grouping by them
+    ↳ Hint: providing more column information will allow the query to group by each column.
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    join fruit (fruit.id == cake.id)
+    group this (aggregate {n = count this})
+    "###).unwrap_err()), @"
+    Error: The dialect PostgresDialect does not support selecting all columns of a relation whose columns are unknown when grouping by them
+    ↳ Hint: providing more column information will allow the query to group by each column.
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    select {id, name}
+    join fruit (==id)
+    group this (aggregate {n = count this})
+    "###).unwrap_err()), @"
+    Error: The dialect PostgresDialect does not support selecting all columns of a relation whose columns are unknown when grouping by them
+    ↳ Hint: providing more column information will allow the query to group by each column.
+    ");
+}
+
+/// When only aggregates survive the grouping, the star is not selected and the
+/// whole-row key is legal, so it is written qualified even for a single
+/// relation, where it used to come out as a bare `GROUP BY *`. With two
+/// relations it was already qualified, and that output is unchanged.
+#[test]
+fn test_group_by_star_whole_row() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    group this (aggregate {n = count this})
+    select {n}
+    "###).unwrap()), @"
+    SELECT
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      cake.*
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    join fruit (fruit.id == cake.id)
+    group this (aggregate {n = count this})
+    select {n}
+    "###).unwrap()), @"
+    SELECT
+      COUNT(*) AS n
+    FROM
+      cake
+      INNER JOIN fruit ON fruit.id = cake.id
+    GROUP BY
+      cake.*,
+      fruit.*
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    select {id, name}
+    join fruit (==id)
+    group this (aggregate {n = count this})
+    select {n}
+    "###).unwrap()), @"
+    SELECT
+      COUNT(*) AS n
+    FROM
+      cake
+      INNER JOIN fruit ON cake.id = fruit.id
+    GROUP BY
+      cake.id,
+      cake.name,
+      fruit.*
+    ");
+}
+
+/// Whenever the columns are known, grouping by `this` lists them: a `select`,
+/// a table declaration, a `derive` over a declared table and an s-string whose
+/// projection can be read all give lowering a column list, and no wildcard
+/// reaches `GROUP BY`.
+#[test]
+fn test_group_by_this_known_columns() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from cake
+    select {id, name}
+    group this (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      id,
+      name,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      id,
+      name
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    module default_db {
+      let cake <[{ id = int, name = text }]>
+    }
+
+    from cake
+    group this (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      id,
+      name,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      id,
+      name
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    module default_db {
+      let cake <[{ id = int, name = text }]>
+    }
+
+    from cake
+    derive {next_id = id + 1}
+    group this (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      id,
+      name,
+      id + 1 AS next_id,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      id,
+      name,
+      id + 1
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from s"SELECT id, name FROM cake"
+    group this (aggregate {n = count this})
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        id,
+        name
+      FROM
+        cake
+    )
+    SELECT
+      id,
+      name,
+      COUNT(*) AS n
+    FROM
+      table_0
+    GROUP BY
+      id,
+      name
+    ");
+}
+
+/// DuckDB accepts `GROUP BY *` (as `GROUP BY ALL`), so the refusal belongs to
+/// the dialect and not to lowering.
+#[test]
+fn test_group_by_star_duckdb() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.duckdb
+
+    from cake
+    group this (aggregate {n = count this})
+    "###).unwrap()), @"
+    SELECT
+      *,
+      COUNT(*) AS n
+    FROM
+      cake
+    GROUP BY
+      *
+    ");
+}
+
 #[test]
 fn test_group_take_n_01() {
     assert_snapshot!((compile(r###"
@@ -5149,7 +5369,10 @@ fn test_group_all() {
 
     from a=albums
     group a.* (aggregate {count this})
-        "###).unwrap_err(), @"Error: Target dialect does not support * in this position.");
+        "###).unwrap_err(), @"
+    Error: The dialect SQLiteDialect does not support grouping by all columns of a relation whose columns are unknown
+    ↳ Hint: providing more column information will allow the query to group by each column.
+    ");
 
     assert_snapshot!(compile(
         r###"

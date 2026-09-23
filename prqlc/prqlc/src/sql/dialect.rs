@@ -178,6 +178,19 @@ pub(super) enum ColumnExclude {
     Except,
 }
 
+/// How a dialect can group by all columns of a relation whose columns the
+/// compiler does not know, so that there is no column list to write instead.
+pub(super) enum GroupByStar {
+    /// A bare `GROUP BY *`.
+    Bare,
+    /// A whole-row reference, `GROUP BY cake.*`, and only while the grouped
+    /// row's columns are not also selected: the dialect does not carry the
+    /// functional dependency from a whole-row value to the row's columns.
+    WholeRow,
+    /// No spelling at all.
+    Unsupported,
+}
+
 pub enum IdentQuotingStyle {
     AlwaysQuoted,
     ConditionallyQuoted,
@@ -238,9 +251,12 @@ pub(super) trait DialectHandler: Any + Debug {
         IntervalQuotingStyle::NoQuotes
     }
 
-    /// Support for GROUP BY *
-    fn stars_in_group(&self) -> bool {
-        true
+    /// How to group by all columns of a relation without naming them.
+    ///
+    /// A star reaches `GROUP BY` only when the relation has columns the compiler
+    /// does not know; known columns are listed one by one before this is asked.
+    fn group_by_star(&self) -> GroupByStar {
+        GroupByStar::Bare
     }
 
     fn supports_distinct_on(&self) -> bool {
@@ -313,6 +329,12 @@ impl DialectHandler for PostgresDialect {
 
     fn supports_distinct_on(&self) -> bool {
         true
+    }
+
+    // `GROUP BY *` is a syntax error (42601). `GROUP BY cake.*` groups by the
+    // whole row, but fails (42803) once the projection names the row's columns.
+    fn group_by_star(&self) -> GroupByStar {
+        GroupByStar::WholeRow
     }
 
     // https://www.postgresql.org/docs/current/functions-formatting.html
@@ -460,8 +482,8 @@ impl DialectHandler for SQLiteDialect {
         false
     }
 
-    fn stars_in_group(&self) -> bool {
-        false
+    fn group_by_star(&self) -> GroupByStar {
+        GroupByStar::Unsupported
     }
 }
 
