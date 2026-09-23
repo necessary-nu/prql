@@ -234,7 +234,7 @@ impl AnchorContext {
         }
     }
 
-    pub(super) fn contains_wildcard(&self, cids: &[CId]) -> bool {
+    pub(crate) fn contains_wildcard(&self, cids: &[CId]) -> bool {
         for cid in cids {
             let decl = &self.column_decls[cid];
             if let ColumnDecl::RelationColumn(_, _, RelationColumn::Wildcard) = decl {
