@@ -3509,14 +3509,16 @@ fn test_row_number_star_partition() {
 
 /// `GROUP BY` is the third key position a wildcard reaches. A wildcard only
 /// gets this far when the relation's columns are unknown, so there is nothing to
-/// list in its place, and PostgreSQL takes neither spelling of it while the
-/// grouped columns are also selected: `GROUP BY *` is 42601, and
-/// `SELECT * ... GROUP BY cake.*` is 42803 because the functional dependency is
-/// not carried from a whole-row var to its columns. So the query is refused.
+/// list in its place. `GROUP BY *` is 42601, and the whole-row `GROUP BY cake.*`
+/// does not make the row's columns readable: PostgreSQL does not carry the
+/// functional dependency from a whole-row var to its columns. Reading the star
+/// beside it, which stands for every column, is 42803, so the query is refused
+/// and the error names the star.
 ///
 /// With two relations the stars were already qualified and came out as
 /// `GROUP BY cake.*, fruit.*`, failing 42803 the same way. Knowing one side's
-/// columns does not help: the other side's star is still selected.
+/// columns does not help: the other side's star is still read. A star read in
+/// a later SELECT counts too, since the SELECT that groups has to project it.
 #[test]
 fn test_group_by_star_selected() {
     assert_snapshot!((compile(r###"
@@ -3525,7 +3527,8 @@ fn test_group_by_star_selected() {
     from cake
     group this (aggregate {n = count this})
     "###).unwrap_err()), @"
-    Error: The dialect PostgresDialect does not support selecting all columns of a relation whose columns are unknown when grouping by them
+    Error: The dialect PostgresDialect does not support grouping by all columns of a relation whose columns are unknown while using its columns outside an aggregation
+    ↳ Hint: `cake.*` is used outside an aggregation.
     ↳ Hint: providing more column information will allow the query to group by each column.
     ");
 
@@ -3536,7 +3539,8 @@ fn test_group_by_star_selected() {
     join fruit (fruit.id == cake.id)
     group this (aggregate {n = count this})
     "###).unwrap_err()), @"
-    Error: The dialect PostgresDialect does not support selecting all columns of a relation whose columns are unknown when grouping by them
+    Error: The dialect PostgresDialect does not support grouping by all columns of a relation whose columns are unknown while using its columns outside an aggregation
+    ↳ Hint: `cake.*` is used outside an aggregation.
     ↳ Hint: providing more column information will allow the query to group by each column.
     ");
 
@@ -3548,7 +3552,21 @@ fn test_group_by_star_selected() {
     join fruit (==id)
     group this (aggregate {n = count this})
     "###).unwrap_err()), @"
-    Error: The dialect PostgresDialect does not support selecting all columns of a relation whose columns are unknown when grouping by them
+    Error: The dialect PostgresDialect does not support grouping by all columns of a relation whose columns are unknown while using its columns outside an aggregation
+    ↳ Hint: `fruit.*` is used outside an aggregation.
+    ↳ Hint: providing more column information will allow the query to group by each column.
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from tally
+    group this (aggregate {n = count this})
+    group {n} (sort fruit | take 1)
+    select {n}
+    "###).unwrap_err()), @"
+    Error: The dialect PostgresDialect does not support grouping by all columns of a relation whose columns are unknown while using its columns outside an aggregation
+    ↳ Hint: `tally.*` is used outside an aggregation.
     ↳ Hint: providing more column information will allow the query to group by each column.
     ");
 }
@@ -3609,6 +3627,117 @@ fn test_group_by_star_whole_row() {
     GROUP BY
       cake.id,
       cake.name,
+      fruit.*
+    ");
+}
+
+/// A named column of a relation grouped by its whole row is a key too: `this`
+/// lowers to every column the relation is known to have, plus the star for the
+/// rest. The star used to swallow those keys when written out, leaving
+/// `GROUP BY tally.*` alone, and reading `fruit` beside it was 42803 in every
+/// position. It is now written as a key of its own whenever the SELECT reads it
+/// outside an aggregation: in the select list, in `HAVING`, in `ORDER BY`, in
+/// `DISTINCT ON`, inside an expression computed later (here through a CTE), and
+/// for a column of a joined relation.
+#[test]
+fn test_group_by_star_named_columns() {
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from tally
+    group this (aggregate {n = count this})
+    select {fruit, n}
+    sort fruit
+    "###).unwrap()), @"
+    SELECT
+      fruit,
+      COUNT(*) AS n
+    FROM
+      tally
+    GROUP BY
+      fruit,
+      tally.*
+    ORDER BY
+      fruit
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from tally
+    group this (aggregate {n = count this})
+    filter fruit == "apple"
+    select {n}
+    "###).unwrap()), @"
+    SELECT
+      COUNT(*) AS n
+    FROM
+      tally
+    GROUP BY
+      fruit,
+      tally.*
+    HAVING
+      fruit = 'apple'
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from tally
+    group this (aggregate {n = count this})
+    group {fruit} (take 1)
+    select {n}
+    "###).unwrap()), @"
+    SELECT
+      DISTINCT ON (fruit) COUNT(*) AS n
+    FROM
+      tally
+    GROUP BY
+      fruit,
+      tally.*
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from tally
+    group this (aggregate {n = count this})
+    select {q = qty + 1, n}
+    "###).unwrap()), @"
+    WITH table_0 AS (
+      SELECT
+        COUNT(*) AS n,
+        qty
+      FROM
+        tally
+      GROUP BY
+        qty,
+        tally.*
+    )
+    SELECT
+      qty + 1 AS q,
+      n
+    FROM
+      table_0
+    ");
+
+    assert_snapshot!((compile(r###"
+    prql target:sql.postgres
+
+    from tally
+    join fruit (tally.fruit == fruit.name)
+    group this (aggregate {n = count this})
+    select {fruit.color, n}
+    "###).unwrap()), @"
+    SELECT
+      fruit.color,
+      COUNT(*) AS n
+    FROM
+      tally
+      INNER JOIN fruit ON tally.fruit = fruit.name
+    GROUP BY
+      tally.*,
+      fruit.color,
       fruit.*
     ");
 }

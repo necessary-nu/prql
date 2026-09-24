@@ -183,9 +183,10 @@ pub(super) enum ColumnExclude {
 pub(super) enum GroupByStar {
     /// A bare `GROUP BY *`.
     Bare,
-    /// A whole-row reference, `GROUP BY cake.*`, and only while the grouped
-    /// row's columns are not also selected: the dialect does not carry the
-    /// functional dependency from a whole-row value to the row's columns.
+    /// A whole-row reference, `GROUP BY cake.*`. The dialect does not carry the
+    /// functional dependency from a whole-row value to the row's columns, so a
+    /// column read outside an aggregation has to be written as a key of its own,
+    /// and the star cannot be read at all.
     WholeRow,
     /// No spelling at all.
     Unsupported,
@@ -332,7 +333,8 @@ impl DialectHandler for PostgresDialect {
     }
 
     // `GROUP BY *` is a syntax error (42601). `GROUP BY cake.*` groups by the
-    // whole row, but fails (42803) once the projection names the row's columns.
+    // whole row, but a column of the row read outside an aggregate function
+    // fails (42803) unless it is a key of its own.
     fn group_by_star(&self) -> GroupByStar {
         GroupByStar::WholeRow
     }

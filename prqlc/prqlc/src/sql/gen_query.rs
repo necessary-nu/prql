@@ -19,7 +19,9 @@ use super::{Context, Dialect};
 use crate::debug;
 use crate::ir::generic::ColumnSort;
 use crate::ir::pl::{JoinSide, Literal};
-use crate::ir::rq::{new_binop, CId, Expr, ExprKind, RelationLiteral, RelationalQuery};
+use crate::ir::rq::{
+    new_binop, CId, Expr, ExprKind, RelationColumn, RelationLiteral, RelationalQuery,
+};
 use crate::utils::{BreakUp, Pluck};
 use crate::{Error, Result, WithErrorInfo};
 use prqlc_parser::generic::InterpolateItem;
@@ -122,6 +124,7 @@ fn translate_select_pipeline(
     let takes = pipeline.pluck(|t| t.into_take());
     let is_distinct = pipeline.iter().any(|t| matches!(t, SqlTransform::Distinct));
     let distinct_ons = pipeline.pluck(|t| t.into_distinct_on());
+    let distinct_on_keys: Vec<CId> = distinct_ons.iter().flatten().copied().collect();
     let distinct = if is_distinct {
         Some(sql_ast::Distinct::Distinct)
     } else if !distinct_ons.is_empty() {
@@ -186,13 +189,33 @@ fn translate_select_pipeline(
         having_conditions.insert(0, has_rows());
     }
 
+    // The columns this SELECT reads after grouping: its select list, its
+    // `DISTINCT ON` key and its `ORDER BY`. `HAVING` is read through its
+    // conditions.
+    let read_after_grouping = [
+        selected.as_slice(),
+        distinct_on_keys.as_slice(),
+        &order_by
+            .last()
+            .map(|sorts| sorts.iter().map(|sort| sort.column).collect_vec())
+            .unwrap_or_default(),
+    ]
+    .concat();
+    let whole_row_keys =
+        group_by_whole_row(&group_by, &read_after_grouping, &having_conditions, ctx)?;
+
     // WHERE and HAVING
     let where_ = filter_of_conditions(before_agg.pluck(|t| t.into_filter()), ctx)?;
     let having = filter_of_conditions(having_conditions, ctx)?;
 
-    ctx.query.qualify_stars = group_by_whole_row(&group_by, &selected, ctx)?;
-    let group_by = try_into_exprs(group_by, ctx, None);
-    ctx.query.qualify_stars = false;
+    let group_by = if let Some(keep) = whole_row_keys {
+        ctx.query.qualify_stars = true;
+        let keys = try_into_exprs_keeping(group_by, &keep, ctx, None);
+        ctx.query.qualify_stars = false;
+        keys
+    } else {
+        try_into_exprs(group_by, ctx, None)
+    };
     let group_by = sql_ast::GroupByExpr::Expressions(group_by?, vec![]);
 
     ctx.query.pre_projection = false;
@@ -348,7 +371,8 @@ fn translate_order_by(
 }
 
 /// Whether a wildcard in the `GROUP BY` key has to be written as a whole-row
-/// reference, or an error if the dialect cannot write it at all.
+/// reference, and which named keys then have to be written beside it; or an
+/// error if the dialect cannot write this query at all.
 ///
 /// A wildcard in the key means columns the compiler does not know. Every column
 /// it does know is already listed: lowering expands `this` or `cake.*` into the
@@ -358,41 +382,72 @@ fn translate_order_by(
 ///
 /// PostgreSQL rejects a bare `GROUP BY *` (42601). It accepts the whole-row
 /// `GROUP BY cake.*`, but does not carry the functional dependency from that
-/// whole-row value to the row's columns, so `SELECT * ... GROUP BY cake.*` fails
-/// too (42803). The whole-row key is therefore only usable when the star is not
-/// also selected, as when only aggregates survive the grouping.
-fn group_by_whole_row(group_by: &[CId], selected: &[CId], ctx: &Context) -> Result<bool> {
+/// whole-row value to the row's columns. Beside it, a column of `cake` may be
+/// read outside an aggregate function only if it is written as a key of its own.
+/// Any other read, the star included, is 42803, wherever in the SELECT it
+/// occurs. So the named keys the SELECT reads are written out, and a read that
+/// no key covers refuses the query. `read_after_grouping` and `having` are
+/// what the SELECT reads after grouping (see `AnchorContext::whole_row_reads`).
+fn group_by_whole_row(
+    group_by: &[CId],
+    read_after_grouping: &[CId],
+    having: &[Expr],
+    ctx: &Context,
+) -> Result<Option<Vec<CId>>> {
     if !ctx.anchor.contains_wildcard(group_by) {
-        return Ok(false);
+        return Ok(None);
     }
 
-    let unsupported = |what: &str| {
-        Error::new_simple(format!(
+    let unsupported = |what: &str, why: Option<String>| {
+        let error = Error::new_simple(format!(
             "The dialect {:?} does not support {what}",
             ctx.dialect
-        ))
-        .push_hint(
-            "providing more column information will allow the query to group by each column.",
-        )
+        ));
+        why.into_iter()
+            .fold(error, |error, why| error.push_hint(why))
+            .push_hint(
+                "providing more column information will allow the query to group by each column.",
+            )
     };
 
     match ctx.dialect.group_by_star() {
-        GroupByStar::Bare => Ok(false),
+        GroupByStar::Bare => Ok(None),
         GroupByStar::WholeRow => {
-            let star_selected = group_by.iter().any(|cid| {
-                selected.contains(cid) && ctx.anchor.contains_wildcard(std::slice::from_ref(cid))
-            });
-            if star_selected {
-                Err(unsupported(
-                    "selecting all columns of a relation whose columns are unknown when grouping by them",
-                ))
-            } else {
-                Ok(true)
+            match ctx
+                .anchor
+                .whole_row_reads(group_by, read_after_grouping, having)
+            {
+                Ok(named_keys) => Ok(Some(named_keys)),
+                Err(read) => Err(unsupported(
+                    "grouping by all columns of a relation whose columns are unknown while using its columns outside an aggregation",
+                    Some(format!(
+                        "{} is used outside an aggregation.",
+                        describe_column(read, ctx)
+                    )),
+                )),
             }
         }
         GroupByStar::Unsupported => Err(unsupported(
             "grouping by all columns of a relation whose columns are unknown",
+            None,
         )),
+    }
+}
+
+/// A relation column as the user would write it: `tally.fruit`, or `tally.*`
+/// for the star.
+fn describe_column(cid: CId, ctx: &Context) -> String {
+    let Some(ColumnDecl::RelationColumn(riid, _, col)) = ctx.anchor.column_decls.get(&cid) else {
+        return "A column".to_string();
+    };
+    let column = match col {
+        RelationColumn::Wildcard => "*".to_string(),
+        RelationColumn::Single(Some(name)) => name.clone(),
+        RelationColumn::Single(None) => return "A column".to_string(),
+    };
+    match &ctx.anchor.relation_instances[riid].table_ref.name {
+        Some(table) => format!("`{table}.{column}`"),
+        None => format!("`{column}`"),
     }
 }
 

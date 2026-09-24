@@ -1,12 +1,13 @@
 //! Context for the PQ anchoring stage: tracks table, column, and relation-instance
 //! declarations, and generates fresh IDs and names for tables and columns as RQ is
 //! lowered towards SQL.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter::zip;
 
 use enum_as_inner::EnumAsInner;
 use serde::Serialize;
 
+use super::anchor::CidCollector;
 use super::ast::{SqlRelation, SqlTransform};
 use crate::ir::pl::Ident;
 use crate::ir::rq::{
@@ -265,6 +266,75 @@ impl AnchorContext {
             }
             _ => false,
         }
+    }
+
+    /// What a SELECT grouped by whole rows reads, outside an aggregation, of the
+    /// relations it groups that way.
+    ///
+    /// `group_by` holds the grouping keys, and a wildcard among them groups its
+    /// relation by the whole row (`GROUP BY cake.*`). PostgreSQL does not carry
+    /// the functional dependency from that whole-row value to the row's columns:
+    /// beside such a key, a column of the relation may be read outside an
+    /// aggregate function only if it is written as a key of its own. That holds
+    /// in the select list, in `HAVING`, in `ORDER BY` and in `DISTINCT ON`
+    /// alike, and inside an expression as much as bare.
+    ///
+    /// `cids` are the columns the SELECT reads after grouping, and `exprs` are
+    /// expressions it reads them through (the `HAVING` conditions). An
+    /// aggregation is not looked into, because a column read inside one needs no
+    /// grouping. Any other computed column that is not itself a key is looked
+    /// through to the columns it reads.
+    ///
+    /// Returns the named keys of those relations that are read, which must be
+    /// written out beside the whole-row key, or else the first read no key
+    /// covers: a column that is not a key, or the relation's star, which stands
+    /// for all of its columns.
+    pub(crate) fn whole_row_reads(
+        &self,
+        group_by: &[CId],
+        cids: &[CId],
+        exprs: &[Expr],
+    ) -> std::result::Result<Vec<CId>, CId> {
+        let whole_rows: HashSet<RIId> = group_by
+            .iter()
+            .filter_map(|cid| match self.column_decls.get(cid) {
+                Some(ColumnDecl::RelationColumn(riid, _, RelationColumn::Wildcard)) => Some(*riid),
+                _ => None,
+            })
+            .collect();
+
+        let mut pending: Vec<CId> = cids.iter().rev().copied().collect();
+        for expr in exprs.iter().rev() {
+            pending.extend(CidCollector::collect(expr.clone()));
+        }
+        let mut named_keys = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(cid) = pending.pop() {
+            if !seen.insert(cid) {
+                continue;
+            }
+            match self.column_decls.get(&cid) {
+                Some(ColumnDecl::RelationColumn(riid, _, col)) if whole_rows.contains(riid) => {
+                    let is_star = matches!(col, RelationColumn::Wildcard);
+                    if is_star || !group_by.contains(&cid) {
+                        return Err(cid);
+                    }
+                    named_keys.push(cid);
+                }
+                Some(ColumnDecl::Compute(compute)) => {
+                    if compute.is_aggregation || group_by.contains(&cid) {
+                        continue;
+                    }
+                    pending.extend(CidCollector::collect(compute.expr.clone()));
+                    if let Some(window) = &compute.window {
+                        pending.extend(window.partition.iter().copied());
+                        pending.extend(window.sort.iter().map(|sort| sort.column));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(named_keys)
     }
 
     pub(crate) fn contains_wildcard(&self, cids: &[CId]) -> bool {
