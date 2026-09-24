@@ -101,8 +101,7 @@ struct QueryOpts {
     /// load-bearing and is kept regardless of how many relations the query has.
     ///
     /// `GROUP BY` is such a position only where the dialect groups by a whole
-    /// row and the row's columns are not also selected; see
-    /// `gen_query::group_by_whole_row`.
+    /// row; see `gen_query::group_by_whole_row`.
     pub qualify_stars: bool,
 
     /// True when translating function that will have an OVER clause.

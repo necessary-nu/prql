@@ -21,7 +21,37 @@ pub(super) fn try_into_exprs(
     span: Option<Span>,
 ) -> Result<Vec<sql_ast::Expr>> {
     let (cids, excluded) = translate_wildcards(&ctx.anchor, cids);
+    translate_keys(cids, excluded, ctx, span)
+}
 
+/// Like [try_into_exprs], but the named columns in `keep` stay keys of their
+/// own instead of being left to a star of their relation.
+///
+/// For `GROUP BY` beside a whole-row key (`cake.*`) that is not cosmetic. The
+/// whole-row key does not make the row's columns available to the rest of the
+/// SELECT, and only a column written as a key is (see
+/// `AnchorContext::whole_row_reads`).
+pub(super) fn try_into_exprs_keeping(
+    cids: Vec<CId>,
+    keep: &[CId],
+    ctx: &mut Context,
+    span: Option<Span>,
+) -> Result<Vec<sql_ast::Expr>> {
+    let (written, excluded) = translate_wildcards(&ctx.anchor, cids.clone());
+    let cids = cids
+        .into_iter()
+        .filter(|cid| written.contains(cid) || keep.contains(cid))
+        .unique()
+        .collect();
+    translate_keys(cids, excluded, ctx, span)
+}
+
+fn translate_keys(
+    cids: Vec<CId>,
+    excluded: Excluded,
+    ctx: &mut Context,
+    span: Option<Span>,
+) -> Result<Vec<sql_ast::Expr>> {
     let mut res = Vec::new();
     for cid in cids {
         let decl = ctx.anchor.column_decls.get(&cid).unwrap();
