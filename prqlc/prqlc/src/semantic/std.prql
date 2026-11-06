@@ -146,6 +146,20 @@ let remove = `default_db.bottom`<relation> top<relation> -> <relation> (
   filter (tuple_reduce std.and (tuple_map _is_null b.*))
   select t.*
 )
+
+# `INTERSECT ALL` and `EXCEPT ALL` as relation-level operations, as `append`
+# is `UNION ALL`: the operands correspond by position and are combined whole
+# rather than joined column by column, so neither operand's columns need to be
+# known, and a column count known to differ is refused.
+let _intersect_all = func
+  `default_db.bottom`<relation>
+  top<relation>
+  -> <relation> internal intersect_all
+let _except_all = func
+  `default_db.bottom`<relation>
+  top<relation>
+  -> <relation> internal except_all
+
 let loop = func
   pipeline <transform>
   top <relation>

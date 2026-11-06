@@ -265,6 +265,8 @@ impl PlFold for FrameCollector {
                         | pl::TransformKind::Select { assigns: ref e }
                         | pl::TransformKind::Filter { filter: ref e }
                         | pl::TransformKind::Append(ref e)
+                        | pl::TransformKind::Intersect(ref e)
+                        | pl::TransformKind::Except(ref e)
                         | pl::TransformKind::Loop(ref e)
                         | pl::TransformKind::Group {
                             pipeline: ref e, ..

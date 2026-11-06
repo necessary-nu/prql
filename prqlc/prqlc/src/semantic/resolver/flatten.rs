@@ -151,9 +151,14 @@ impl PlFold for Flattener {
                         // in scope for downstream transforms in the outer pipeline. Per the PRQL
                         // spec a join retains the left (input) side's order, so snapshot the
                         // input's sort and restore it after folding the kind.
-                        let input_sort =
-                            matches!(kind, TransformKind::Join { .. } | TransformKind::Append(_))
-                                .then(|| self.sort.clone());
+                        let input_sort = matches!(
+                            kind,
+                            TransformKind::Join { .. }
+                                | TransformKind::Append(_)
+                                | TransformKind::Intersect(_)
+                                | TransformKind::Except(_)
+                        )
+                        .then(|| self.sort.clone());
 
                         let kind = fold_transform_kind(self, kind)?;
 
@@ -177,8 +182,13 @@ impl PlFold for Flattener {
                 //   derive {`album_name` = `name`}
                 //   select {`artist_id`, `album_name`}
                 // ) (this.id == that.artist_id)
-                let sort = if matches!(kind, TransformKind::Join { .. } | TransformKind::Append(_))
-                {
+                let sort = if matches!(
+                    kind,
+                    TransformKind::Join { .. }
+                        | TransformKind::Append(_)
+                        | TransformKind::Intersect(_)
+                        | TransformKind::Except(_)
+                ) {
                     vec![]
                 } else {
                     self.sort.clone()

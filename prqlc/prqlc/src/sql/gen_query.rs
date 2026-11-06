@@ -487,6 +487,7 @@ fn translate_set_ops_pipeline(
 
         // Left hand side (aka top)
         let left = query_to_set_expr(top, context);
+        let left = bracket_set_operand(left, op, false, context);
 
         // Right hand side (aka bottom)
         let right_rel = translate_relation_expr(bottom, context)?;
@@ -504,6 +505,7 @@ fn translate_set_ops_pipeline(
                 ..default_select()
             })))
         };
+        let right = bracket_set_operand(right, op, true, context);
 
         top = default_query(SetExpr::SetOperation {
             left,
@@ -522,6 +524,27 @@ fn translate_set_ops_pipeline(
     }
 
     Ok(top)
+}
+
+/// A set operation nested as an operand of `outer`, wrapped where SQL would
+/// otherwise regroup it: set operations associate left, so one on the right
+/// is always its own operand, and `INTERSECT` binds tighter than `UNION` and
+/// `EXCEPT`, so one of those on the left of an `INTERSECT` is too.
+fn bracket_set_operand(
+    operand: Box<SetExpr>,
+    outer: sql_ast::SetOperator,
+    right: bool,
+    context: &mut Context,
+) -> Box<SetExpr> {
+    let SetExpr::SetOperation { op: inner, .. } = operand.as_ref() else {
+        return operand;
+    };
+    let tighter =
+        outer == sql_ast::SetOperator::Intersect && *inner != sql_ast::SetOperator::Intersect;
+    if !(right || tighter) {
+        return operand;
+    }
+    wrap_query(default_query(*operand), context)
 }
 
 fn translate_relation_expr(relation_expr: RelationExpr, ctx: &mut Context) -> Result<TableFactor> {
@@ -895,8 +918,12 @@ fn query_to_set_expr(query: sql_ast::Query, context: &mut Context) -> Box<SetExp
         return query.body;
     }
 
-    // Query is not simple, so we need to wrap it.
-    //
+    wrap_query(query, context)
+}
+
+/// A query as a set operand that can carry its own clauses — and its own set
+/// operation, which then stays one operand.
+fn wrap_query(query: sql_ast::Query, context: &mut Context) -> Box<SetExpr> {
     // Some engines (like SQLite) do not support subqueries between simple parentheses, so we keep
     // the general `SELECT * FROM (query)` by default.
     //

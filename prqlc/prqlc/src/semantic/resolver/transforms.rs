@@ -312,6 +312,16 @@ impl Resolver<'_> {
                     (TransformKind::Append(Box::new(bottom)), top)
                 }
             }
+            "intersect_all" => {
+                let [bottom, top] = unpack::<2>(func.args);
+
+                (TransformKind::Intersect(Box::new(bottom)), top)
+            }
+            "except_all" => {
+                let [bottom, top] = unpack::<2>(func.args);
+
+                (TransformKind::Except(Box::new(bottom)), top)
+            }
             "loop" => {
                 let [pipeline, tbl] = unpack::<2>(func.args);
 
@@ -742,11 +752,20 @@ impl Resolver<'_> {
                     .ok_or(Error::new_assert("expected function").with_span(pipeline_span))?;
                 pipeline.return_ty.map(|x| *x)
             }
-            TransformKind::Append(bottom) => {
+            TransformKind::Append(bottom)
+            | TransformKind::Intersect(bottom)
+            | TransformKind::Except(bottom) => {
                 let top = transform_call.input.ty.clone().unwrap();
                 let bottom = bottom.ty.clone().unwrap();
+                let op = set_op_name(&transform_call.kind);
 
-                Some(type_intersection(top, bottom).with_span(transform_call.input.span)?)
+                let ty = type_intersection(top, bottom).map_err(|mut error| {
+                    for hint in &mut error.hints {
+                        *hint = hint.replace("`append`", &format!("`{op}`"));
+                    }
+                    error
+                });
+                Some(ty.with_span(transform_call.input.span)?)
             }
         })
     }
@@ -903,7 +922,17 @@ impl TransformCall {
             Append(bottom) => {
                 let top = lineage_or_default(&self.input)?;
                 let bottom = lineage_or_default(bottom)?;
-                append(top, bottom)?
+                append(top, bottom, "append")?
+            }
+            Intersect(bottom) => {
+                let top = lineage_or_default(&self.input)?;
+                let bottom = lineage_or_default(bottom)?;
+                append(top, bottom, "_intersect_all")?
+            }
+            Except(bottom) => {
+                let top = lineage_or_default(&self.input)?;
+                let bottom = lineage_or_default(bottom)?;
+                append(top, bottom, "_except_all")?
             }
             Loop(_) => lineage_or_default(&self.input)?,
             Sort { .. } | Filter { .. } | Take { .. } => lineage_or_default(&self.input)?,
@@ -917,11 +946,40 @@ fn join(mut lhs: Lineage, rhs: Lineage) -> Lineage {
     lhs
 }
 
-fn append(mut top: Lineage, bottom: Lineage) -> Result<Lineage, Error> {
+/// The std name of the set operation a transform is.
+fn set_op_name(kind: &TransformKind) -> &'static str {
+    match kind {
+        TransformKind::Intersect(_) => "_intersect_all",
+        TransformKind::Except(_) => "_except_all",
+        _ => "append",
+    }
+}
+
+/// The lineage of the set operation std names `op`, combining `top` with
+/// `bottom` by column position.
+fn append(mut top: Lineage, bottom: Lineage, op: &str) -> Result<Lineage, Error> {
+    let verb = match op {
+        "_intersect_all" => "intersect",
+        "_except_all" => "take the difference of",
+        _ => "append",
+    };
+    // A wildcard stands for columns no declaration lists, and the singles
+    // beside it may be inferred columns the wildcard already covers, so with
+    // one on either side the frames say nothing about how the positions line
+    // up. The relation keeps the top's columns, and whether the two arities
+    // agree is the database's to check, as it is for the `*` it is sent.
+    let has_wildcard = |lineage: &Lineage| lineage.columns.iter().any(LineageColumn::is_all);
+    let positional = top.columns.len() == bottom.columns.len()
+        && zip(&top.columns, &bottom.columns).all(|(t, b)| t.is_all() == b.is_all());
+    if !positional && (has_wildcard(&top) || has_wildcard(&bottom)) {
+        top.inputs.extend(bottom.inputs);
+        return Ok(top);
+    }
+
     if top.columns.len() != bottom.columns.len() {
-        return Err(Error::new_simple(
-            "cannot append two relations with non-matching number of columns.",
-        ))
+        return Err(Error::new_simple(format!(
+            "cannot {verb} two relations with non-matching number of columns."
+        )))
         .push_hint(format!(
             "top has {} columns, but bottom has {}",
             top.columns.len(),
@@ -985,12 +1043,14 @@ fn append(mut top: Lineage, bottom: Lineage) -> Result<Lineage, Error> {
                     },
                 }
             }
-            (t, b) => return Err(Error::new_simple(format!(
-                "cannot match columns `{t:?}` and `{b:?}`"
-            ))
-            .push_hint(
-                "make sure that top and bottom relations of append has the same column layout",
+            (t, b) => {
+                return Err(
+                    Error::new_simple(format!("cannot match columns `{t:?}` and `{b:?}`"))
+                        .push_hint(format!(
+                "make sure that top and bottom relations of {op} has the same column layout"
             )),
+                )
+            }
         });
     }
 

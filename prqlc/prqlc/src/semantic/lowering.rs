@@ -618,6 +618,18 @@ impl Lowerer {
 
                 self.pipeline.push(Transform::Append(bottom));
             }
+            pl::TransformKind::Intersect(bottom) => {
+                let mut bottom = self.lower_table_ref(*bottom)?;
+                bottom.prefer_cte = false;
+
+                self.pipeline.push(Transform::Intersect(bottom));
+            }
+            pl::TransformKind::Except(bottom) => {
+                let mut bottom = self.lower_table_ref(*bottom)?;
+                bottom.prefer_cte = false;
+
+                self.pipeline.push(Transform::Except(bottom));
+            }
             pl::TransformKind::Loop(pipeline) => {
                 let relation = self.lower_relation(*pipeline)?;
                 let mut pipeline = relation.kind.into_pipeline().unwrap();

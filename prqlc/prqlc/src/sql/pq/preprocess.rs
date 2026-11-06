@@ -296,33 +296,84 @@ fn int_expr(i: i64) -> Expr {
     }
 }
 
-/// Creates [SqlTransform::Union] from [Transform::Append]
+/// Creates [SqlTransform::Union], [SqlTransform::Intersect] and
+/// [SqlTransform::Except] from [Transform::Append], [Transform::Intersect] and
+/// [Transform::Except]
 pub(in crate::sql) fn union(
     pipeline: Vec<SqlTransform>,
     ctx: &mut Context,
 ) -> Result<Vec<SqlTransform>> {
     use SqlTransform::*;
-    use Transform::*;
 
     let mut res = Vec::with_capacity(pipeline.len());
     let mut pipeline = pipeline.into_iter().peekable();
     while let Some(t) = pipeline.next() {
-        let Super(Append(bottom)) = t else {
-            res.push(t);
-            continue;
+        let (bottom, op) = match t {
+            Super(Transform::Append(bottom)) => (bottom, SetOp::Union),
+            Super(Transform::Intersect(bottom)) => (bottom, SetOp::Intersect),
+            Super(Transform::Except(bottom)) => (bottom, SetOp::Except),
+            t => {
+                res.push(t);
+                continue;
+            }
         };
         let bottom = ctx.anchor.create_relation_instance(bottom, HashMap::new());
 
-        let distinct = if let Some(Distinct) = &pipeline.peek() {
+        // `UNION ALL` and `INTERSECT ALL` followed by `DISTINCT` are their
+        // `DISTINCT` forms. So are `INTERSECT ALL` and `EXCEPT ALL` of a
+        // distinct top: each row of it then occurs once, which is what the
+        // `DISTINCT` forms make of it, whatever the bottom holds. `EXCEPT ALL`
+        // followed by `DISTINCT` is not: it keeps a row the bottom holds fewer
+        // times than the top.
+        let distinct_top = op != SetOp::Union && matches!(res.last(), Some(Distinct));
+        let distinct_after = op != SetOp::Except && matches!(pipeline.peek(), Some(Distinct));
+        if distinct_top {
+            res.pop();
+        }
+        if distinct_after {
             pipeline.next();
-            true
-        } else {
-            false
-        };
+        }
+        let distinct = distinct_top || distinct_after;
 
-        res.push(SqlTransform::Union { bottom, distinct });
+        if !distinct {
+            let supported = match op {
+                SetOp::Union => true,
+                SetOp::Intersect => ctx.dialect.intersect_all(),
+                SetOp::Except => ctx.dialect.except_all(),
+            };
+            if !supported {
+                return Err(Error::new_simple(format!(
+                    "The dialect {:?} does not support {}",
+                    ctx.dialect,
+                    op.sql_all()
+                )));
+            }
+        }
+
+        res.push(match op {
+            SetOp::Union => Union { bottom, distinct },
+            SetOp::Intersect => Intersect { bottom, distinct },
+            SetOp::Except => Except { bottom, distinct },
+        });
     }
     Ok(res)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetOp {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl SetOp {
+    fn sql_all(self) -> &'static str {
+        match self {
+            SetOp::Union => "UNION ALL",
+            SetOp::Intersect => "INTERSECT ALL",
+            SetOp::Except => "EXCEPT ALL",
+        }
+    }
 }
 
 /// Creates [SqlTransform::Except] from [Transform::Join] and [Transform::Filter]

@@ -28,6 +28,10 @@ pub enum Transform {
         filter: Expr,
     },
     Append(TableRef),
+    /// `INTERSECT ALL` of the pipeline and this relation, by column position.
+    Intersect(TableRef),
+    /// `EXCEPT ALL` of this relation from the pipeline, by column position.
+    Except(TableRef),
     Loop(Vec<Transform>),
 }
 
