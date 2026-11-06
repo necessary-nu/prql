@@ -1371,6 +1371,123 @@ fn test_set_operation_operands_keep_their_grouping() {
 }
 
 #[test]
+fn test_stages_read_a_set_operation_whole() {
+    // A projection in the set operation's own query would land on its first
+    // operand alone, and narrowing both would change what INTERSECT and
+    // EXCEPT compare, so a stage that narrows reads the operation from a
+    // query of its own.
+    assert_snapshot!(compile(r#"
+    prql target:sql.postgres
+
+    from album
+    intersect artist
+    select {artist_id}
+    "#).unwrap(),
+        @"
+    WITH table_0 AS (
+      SELECT
+        *
+      FROM
+        album
+      INTERSECT
+      ALL
+      SELECT
+        *
+      FROM
+        artist
+    )
+    SELECT
+      artist_id
+    FROM
+      table_0
+    ");
+    assert_snapshot!(compile(r#"
+    prql target:sql.postgres
+
+    from album
+    append artist
+    select {artist_id}
+    "#).unwrap(),
+        @"
+    WITH table_0 AS (
+      SELECT
+        *
+      FROM
+        album
+      UNION
+      ALL
+      SELECT
+        *
+      FROM
+        artist
+    )
+    SELECT
+      artist_id
+    FROM
+      table_0
+    ");
+    assert_snapshot!(compile(r#"
+    prql target:sql.postgres
+
+    from album
+    select {artist_id, title}
+    remove (from artist | select {artist_id, name})
+    group {artist_id} (aggregate {n = count this})
+    "#).unwrap(),
+        @"
+    WITH table_1 AS (
+      SELECT
+        artist_id,
+        title
+      FROM
+        album
+      EXCEPT
+        ALL
+      SELECT
+        artist_id,
+        name
+      FROM
+        artist
+    )
+    SELECT
+      artist_id,
+      COUNT(*) AS n
+    FROM
+      table_1
+    GROUP BY
+      artist_id
+    ");
+    assert_snapshot!(compile(r#"
+    prql target:sql.postgres
+
+    from album
+    select {artist_id, title}
+    intersect (from artist | select {artist_id, name})
+    select {artist_id}
+    "#).unwrap(),
+        @"
+    WITH table_1 AS (
+      SELECT
+        artist_id,
+        title
+      FROM
+        album
+      INTERSECT
+      ALL
+      SELECT
+        artist_id,
+        name
+      FROM
+        artist
+    )
+    SELECT
+      artist_id
+    FROM
+      table_1
+    ");
+}
+
+#[test]
 fn test_sort_in_nested_join() {
     assert_snapshot!(compile(r#"
     from albums

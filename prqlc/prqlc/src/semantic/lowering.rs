@@ -543,6 +543,8 @@ impl Lowerer {
             }
         };
 
+        let input_lineage = transform_call.input.lineage.clone();
+
         // lower input table
         self.lower_pipeline(*transform_call.input, closure_param)?;
 
@@ -613,18 +615,30 @@ impl Lowerer {
                 self.pipeline.push(transform);
             }
             pl::TransformKind::Append(bottom) => {
+                // A union of two known projections may be pruned arm by arm,
+                // as positional mapping keeps the arms aligned; a wildcard
+                // on either side cannot be mapped, so it is combined whole.
+                let whole = [&input_lineage, &bottom.lineage]
+                    .into_iter()
+                    .flatten()
+                    .any(|lineage| lineage.columns.iter().any(LineageColumn::is_all));
+                if whole {
+                    self.state_combined_columns(input_lineage)?;
+                }
                 let mut bottom = self.lower_table_ref(*bottom)?;
                 bottom.prefer_cte = false;
 
                 self.pipeline.push(Transform::Append(bottom));
             }
             pl::TransformKind::Intersect(bottom) => {
+                self.state_combined_columns(input_lineage)?;
                 let mut bottom = self.lower_table_ref(*bottom)?;
                 bottom.prefer_cte = false;
 
                 self.pipeline.push(Transform::Intersect(bottom));
             }
             pl::TransformKind::Except(bottom) => {
+                self.state_combined_columns(input_lineage)?;
                 let mut bottom = self.lower_table_ref(*bottom)?;
                 bottom.prefer_cte = false;
 
@@ -664,6 +678,20 @@ impl Lowerer {
                 Ok(ColumnSort { direction, column })
             })
             .try_collect()
+    }
+
+    /// State the columns a set operation combines, as a Select of the top's
+    /// frame in front of it.
+    ///
+    /// `INTERSECT` and `EXCEPT` compare every column, so no later projection
+    /// may prune one from either operand; the stated projection keeps them
+    /// all in use, and a narrower projection after the operation is a query
+    /// of its own over it.
+    fn state_combined_columns(&mut self, lineage: Option<Lineage>) -> Result<()> {
+        let mut pipeline = std::mem::take(&mut self.pipeline);
+        let stated = self.push_select(lineage, &mut pipeline);
+        self.pipeline = pipeline;
+        stated.map(|_| ())
     }
 
     /// Append a Select of final table columns derived from frame

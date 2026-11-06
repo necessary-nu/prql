@@ -323,10 +323,15 @@ pub(in crate::sql) fn union(
         // `DISTINCT` forms make of it, whatever the bottom holds. `EXCEPT ALL`
         // followed by `DISTINCT` is not: it keeps a row the bottom holds fewer
         // times than the top.
-        let distinct_top = op != SetOp::Union && matches!(res.last(), Some(Distinct));
+        // the projection lowering states in front of a set operation does not
+        // stand between it and a deduplication of its top
+        let top = res
+            .iter()
+            .rposition(|t| !matches!(t, Super(Transform::Select(_))));
+        let distinct_top = op != SetOp::Union && matches!(top.map(|i| &res[i]), Some(Distinct));
         let distinct_after = op != SetOp::Except && matches!(pipeline.peek(), Some(Distinct));
         if distinct_top {
-            res.pop();
+            res.remove(top.unwrap());
         }
         if distinct_after {
             pipeline.next();

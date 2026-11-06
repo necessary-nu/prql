@@ -91,7 +91,8 @@ pub(super) fn split_off_back(
     let mut curr_pipeline_rev = Vec::new();
     'pipeline: while let Some(transform) = pipeline.pop() {
         // stop if split is needed
-        let split = is_split_required(&transform, &mut following_transforms);
+        let split = is_split_required(&transform, &mut following_transforms)
+            || narrows_set_operation(&transform, &pipeline, &output);
         if split {
             log::debug!("split required after {}", transform.as_str());
             log::debug!(".. following={following_transforms:?}");
@@ -179,8 +180,19 @@ pub(super) fn split_off_back(
     let remaining_pipeline = if pipeline.is_empty() {
         None
     } else {
-        // drop inputs that were satisfied in current pipeline
-        pipeline.push(SqlTransform::Super(Transform::Select(missing)));
+        // drop inputs that were satisfied in current pipeline; a set operation
+        // lowering stated whole keeps every column it combines, since pruning
+        // one from its operands changes what INTERSECT and EXCEPT compare and
+        // cannot be mapped onto an operand that is a wildcard
+        let select = match pipeline.as_slice() {
+            [.., SqlTransform::Super(Transform::Select(stated)), last]
+                if is_set_operation(last) =>
+            {
+                stated.clone()
+            }
+            _ => missing,
+        };
+        pipeline.push(SqlTransform::Super(Transform::Select(select)));
 
         Some(pipeline)
     };
@@ -197,6 +209,32 @@ pub(super) fn split_off_back(
     }
 
     (remaining_pipeline, curr_pipeline_rev)
+}
+
+fn is_set_operation(transform: &SqlTransform) -> bool {
+    matches!(
+        transform,
+        SqlTransform::Union { .. } | SqlTransform::Except { .. } | SqlTransform::Intersect { .. }
+    )
+}
+
+/// Whether `transform` is a set operation whose query would project `output`
+/// rather than the columns lowering stated it combines.
+///
+/// A projection written into a set operation's query lands on its first
+/// operand's `SELECT` alone, so the operands no longer line up, and narrowing
+/// both would change what `INTERSECT` and `EXCEPT` compare. Such a projection
+/// is the next query's, reading the set operation whole.
+fn narrows_set_operation(
+    transform: &SqlTransform,
+    preceding: &[SqlTransform],
+    output: &[CId],
+) -> bool {
+    is_set_operation(transform)
+        && matches!(
+            preceding.last(),
+            Some(SqlTransform::Super(Transform::Select(stated))) if stated.as_slice() != output
+        )
 }
 
 fn can_materialize(compute: &Compute, inputs_required: &[Requirement]) -> (bool, Complexity) {
