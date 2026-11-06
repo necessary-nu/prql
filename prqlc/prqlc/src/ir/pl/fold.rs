@@ -257,6 +257,8 @@ pub fn fold_transform_kind<T: ?Sized + PlFold>(
             filter: Box::new(fold.fold_expr(*filter)?),
         },
         Append(bottom) => Append(Box::new(fold.fold_expr(*bottom)?)),
+        Intersect(bottom) => Intersect(Box::new(fold.fold_expr(*bottom)?)),
+        Except(bottom) => Except(Box::new(fold.fold_expr(*bottom)?)),
         Group { by, pipeline } => Group {
             by: Box::new(fold.fold_expr(*by)?),
             pipeline: Box::new(fold.fold_expr(*pipeline)?),

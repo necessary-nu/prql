@@ -162,6 +162,8 @@ impl PqMapper<RIId, pq::RelationExpr, rq::Transform, ()> for TransformCompiler<'
                             rq::Transform::Take(v) => pq::SqlTransform::Take(v),
                             rq::Transform::Compute(_)
                             | rq::Transform::Append(_)
+                            | rq::Transform::Intersect(_)
+                            | rq::Transform::Except(_)
                             | rq::Transform::Loop(_) => {
                                 // these are not used from here on
                                 return Ok(None);

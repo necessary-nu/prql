@@ -91,6 +91,10 @@ pub enum TransformKind {
         pipeline: Box<Expr>,
     },
     Append(Box<Expr>),
+    /// `INTERSECT ALL` of the input and this relation, by column position.
+    Intersect(Box<Expr>),
+    /// `EXCEPT ALL` of this relation from the input, by column position.
+    Except(Box<Expr>),
     Loop(Box<Expr>),
 }
 
