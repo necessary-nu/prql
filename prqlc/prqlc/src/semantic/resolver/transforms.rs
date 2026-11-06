@@ -312,12 +312,12 @@ impl Resolver<'_> {
                     (TransformKind::Append(Box::new(bottom)), top)
                 }
             }
-            "intersect_all" => {
+            "intersect" => {
                 let [bottom, top] = unpack::<2>(func.args);
 
                 (TransformKind::Intersect(Box::new(bottom)), top)
             }
-            "except_all" => {
+            "remove" => {
                 let [bottom, top] = unpack::<2>(func.args);
 
                 (TransformKind::Except(Box::new(bottom)), top)
@@ -727,6 +727,14 @@ impl Resolver<'_> {
                 let by = by.ty.clone().unwrap();
                 let by = by.kind.into_tuple().map_err(bad_type)?;
 
+                let aggregates = match pipeline.kind.as_func() {
+                    Some(func) => matches!(
+                        &func.body.kind,
+                        ExprKind::TransformCall(call)
+                            if matches!(*call.kind, TransformKind::Aggregate { .. })
+                    ),
+                    None => true,
+                };
                 let pipeline_span = pipeline.span;
                 let pipeline = pipeline.ty.clone().unwrap();
                 let pipeline = pipeline
@@ -734,9 +742,24 @@ impl Resolver<'_> {
                     .into_function()
                     .map_err(bad_type)?
                     .ok_or(Error::new_assert("expected function").with_span(pipeline_span))?;
-                let pipeline = pipeline.return_ty.unwrap().into_relation().ok_or(
+                let mut pipeline = pipeline.return_ty.unwrap().into_relation().ok_or(
                     Error::new_assert("function must return relation").with_span(pipeline_span),
                 )?;
+                // An aggregation's body yields the aggregates alone, which
+                // follow the keys. Any other body (`take 1` deduplicating, a
+                // `sort`) yields the group's rows whole: the input's columns,
+                // a key among them not a second column of its own.
+                if !aggregates {
+                    let input = transform_call.input.ty.clone().unwrap();
+                    pipeline = input.into_relation().unwrap_or_default();
+                    pipeline.retain(|field| match field {
+                        TyTupleField::Single(Some(name), _) => !by.iter().any(
+                            |key| matches!(key, TyTupleField::Single(Some(key), _) if key == name),
+                        ),
+                        TyTupleField::Wildcard(_) => !by.iter().any(TyTupleField::is_wildcard),
+                        TyTupleField::Single(None, _) => true,
+                    });
+                }
 
                 Some(Ty::new(TyKind::Array(Some(Box::new(Ty::new(
                     ty_tuple_kind([by, pipeline].concat()),
@@ -927,12 +950,12 @@ impl TransformCall {
             Intersect(bottom) => {
                 let top = lineage_or_default(&self.input)?;
                 let bottom = lineage_or_default(bottom)?;
-                append(top, bottom, "_intersect_all")?
+                append(top, bottom, "intersect")?
             }
             Except(bottom) => {
                 let top = lineage_or_default(&self.input)?;
                 let bottom = lineage_or_default(bottom)?;
-                append(top, bottom, "_except_all")?
+                append(top, bottom, "remove")?
             }
             Loop(_) => lineage_or_default(&self.input)?,
             Sort { .. } | Filter { .. } | Take { .. } => lineage_or_default(&self.input)?,
@@ -949,8 +972,8 @@ fn join(mut lhs: Lineage, rhs: Lineage) -> Lineage {
 /// The std name of the set operation a transform is.
 fn set_op_name(kind: &TransformKind) -> &'static str {
     match kind {
-        TransformKind::Intersect(_) => "_intersect_all",
-        TransformKind::Except(_) => "_except_all",
+        TransformKind::Intersect(_) => "intersect",
+        TransformKind::Except(_) => "remove",
         _ => "append",
     }
 }
@@ -959,9 +982,8 @@ fn set_op_name(kind: &TransformKind) -> &'static str {
 /// `bottom` by column position.
 fn append(mut top: Lineage, bottom: Lineage, op: &str) -> Result<Lineage, Error> {
     let verb = match op {
-        "_intersect_all" => "intersect",
-        "_except_all" => "take the difference of",
-        _ => "append",
+        "remove" => "take the difference of",
+        op => op,
     };
     // A wildcard stands for columns no declaration lists, and the singles
     // beside it may be inferred columns the wildcard already covers, so with

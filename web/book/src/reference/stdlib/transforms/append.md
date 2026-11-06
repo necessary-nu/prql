@@ -40,7 +40,8 @@ append by:name (
 > _experimental_
 
 Removes rows that appear in another relation, like `EXCEPT ALL`. Duplicate rows
-are removed one-for-one.
+are removed one-for-one. As with `append`, columns correspond by position, and
+relations whose known columns differ in number are refused.
 
 ```prql
 from employees_1
@@ -50,6 +51,10 @@ remove employees_2
 ## Intersection
 
 > _experimental_
+
+Keeps rows that appear in both relations, like `INTERSECT ALL`: a row appearing
+in both is kept as many times as the relation holding fewer copies holds it.
+Columns correspond by position, as with `remove`.
 
 ```prql
 from employees_1

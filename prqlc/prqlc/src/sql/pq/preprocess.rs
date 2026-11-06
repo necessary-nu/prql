@@ -7,12 +7,12 @@ use super::anchor::{infer_complexity, CidCollector, Complexity};
 use super::ast::*;
 
 use crate::ir::generic::{ColumnSort, SortDirection, WindowFrame, WindowKind};
-use crate::ir::pl::{JoinSide, Literal};
+use crate::ir::pl::Literal;
 use crate::ir::rq::{
     self, maybe_binop, new_binop, CId, Compute, Expr, ExprKind, RqFold, Transform, Window,
 };
 use crate::sql::Context;
-use crate::{debug, Error, Result, WithErrorInfo};
+use crate::{debug, Error, Result};
 use prqlc_parser::generic::{InterpolateItem, Range};
 
 /// Converts RQ AST into SqlRQ AST and applies a few preprocessing operations.
@@ -29,8 +29,6 @@ pub(in crate::sql) fn preprocess(
         .and_then(|p| prune_inputs(p, ctx))
         .and_then(|p| distinct(p, ctx))
         .and_then(|p| union(p, ctx))
-        .and_then(|p| except(p, ctx))
-        .and_then(|p| intersect(p, ctx))
         .map(reorder)
         .inspect(|p| {
             debug::log_entry(|| debug::DebugEntryKind::ReprPqEarly(p.clone()));
@@ -374,237 +372,6 @@ impl SetOp {
             SetOp::Except => "EXCEPT ALL",
         }
     }
-}
-
-/// Creates [SqlTransform::Except] from [Transform::Join] and [Transform::Filter]
-pub(in crate::sql) fn except(
-    pipeline: Vec<SqlTransform>,
-    ctx: &mut Context,
-) -> Result<Vec<SqlTransform>> {
-    use SqlTransform::*;
-
-    let output = ctx.anchor.determine_select_columns(&pipeline);
-    let output: HashSet<CId, RandomState> = HashSet::from_iter(output);
-
-    let mut res = Vec::with_capacity(pipeline.len());
-    for t in pipeline {
-        res.push(t);
-
-        if res.len() < 2 {
-            continue;
-        }
-        let SqlTransform::Join {
-            side: JoinSide::Left,
-            filter: join_cond,
-            with,
-        } = &res[res.len() - 2]
-        else {
-            continue;
-        };
-        let Super(Transform::Filter(filter)) = &res[res.len() - 1] else {
-            continue;
-        };
-
-        let with = ctx.anchor.relation_instances.get(with).unwrap();
-
-        let top = ctx.anchor.determine_select_columns(&res[0..res.len() - 2]);
-        let bottom = with.table_ref.columns.iter().map(|(_, c)| *c).collect_vec();
-
-        // join_cond must be a join over all columns
-        // (this could be loosened to check only the relation key)
-        let (join_left, join_right) = collect_equals(join_cond)?;
-        if !all_in(&top, join_left) || !all_in(&bottom, join_right) {
-            continue;
-        }
-
-        // filter has to check for nullability of bottom
-        // (this could be loosened to check only for nulls in a previously non-nullable column)
-        let (filter_left, filter_right) = collect_equals(filter)?;
-        if !(all_in(&bottom, filter_left) && all_null(filter_right)) {
-            continue;
-        }
-
-        // select must not contain things from bottom
-        if bottom.iter().any(|c| output.contains(c)) {
-            continue;
-        }
-
-        // determine DISTINCT
-        let mut distinct = false;
-        // EXCEPT ALL can become EXCEPT DISTINCT, if top is DISTINCT.
-        // DISTINCT-ness of bottom has no effect on the output.
-        if res.len() >= 3 {
-            if let Distinct = &res[res.len() - 3] {
-                distinct = true;
-            }
-        }
-
-        if !distinct && !ctx.dialect.except_all() {
-            // EXCEPT ALL is not supported
-            // can we fall back to anti-join?
-            if ctx.anchor.contains_wildcard(&top) || ctx.anchor.contains_wildcard(&bottom) {
-                return Err(Error::new_simple(format!("The dialect {:?} does not support EXCEPT ALL", ctx.dialect))
-                    .push_hint("providing more column information will allow the query to be translated to an anti-join."));
-            } else {
-                // Don't create Except, fallback to anti-join.
-                continue;
-            }
-        }
-
-        res.pop(); // filter
-        let join = res.pop(); // join
-        let (_, with, _) = join.unwrap().into_join().unwrap();
-        if distinct {
-            if let Some(Distinct) = &res.last() {
-                res.pop();
-            }
-        }
-
-        res.push(SqlTransform::Except {
-            bottom: with,
-            distinct,
-        });
-    }
-
-    Ok(res)
-}
-
-/// Creates [SqlTransform::Intersect] from [Transform::Join]
-pub(in crate::sql) fn intersect(
-    pipeline: Vec<SqlTransform>,
-    ctx: &mut Context,
-) -> Result<Vec<SqlTransform>> {
-    use SqlTransform::*;
-
-    let output = ctx.anchor.determine_select_columns(&pipeline);
-    let output: HashSet<CId, RandomState> = HashSet::from_iter(output);
-
-    let mut res = Vec::with_capacity(pipeline.len());
-    let mut pipeline = pipeline.into_iter().peekable();
-    while let Some(t) = pipeline.next() {
-        res.push(t);
-
-        let Join {
-            side: JoinSide::Inner,
-            filter: join_cond,
-            with,
-        } = &res[res.len() - 1]
-        else {
-            continue;
-        };
-        let with = ctx.anchor.relation_instances.get_mut(with).unwrap();
-
-        let bottom = with.table_ref.columns.iter().map(|(_, c)| *c).collect_vec();
-        let top = ctx.anchor.determine_select_columns(&res[0..res.len() - 1]);
-
-        // join_cond must be a join over all columns
-        // (this could be loosened to check only the relation key)
-        let (left, right) = collect_equals(join_cond)?;
-        if !(all_in(&top, left) && all_in(&bottom, right)) {
-            continue;
-        }
-
-        // select must not contain things from bottom
-        if bottom.iter().any(|c| output.contains(c)) {
-            continue;
-        }
-        // select must contain at least one thing from top
-        if top.iter().all(|c| !output.contains(c)) {
-            continue;
-        }
-
-        // determine DISTINCT
-        let mut distinct = false;
-        // INTERSECT ALL can become INTERSECT DISTINCT
-        // - if top is DISTINCT or
-        // - if output is DISTINCT
-        if res.len() > 1 {
-            if let Distinct = &res[res.len() - 2] {
-                distinct = true;
-            }
-        }
-        if let Some(SqlTransform::Distinct) = pipeline.peek() {
-            distinct = true;
-        }
-
-        if !distinct && !ctx.dialect.intersect_all() {
-            // INTERSECT ALL is not supported
-            // can we fall back to anti-join?
-            if ctx.anchor.contains_wildcard(&top) || ctx.anchor.contains_wildcard(&bottom) {
-                return Err(Error::new_simple(format!("The dialect {:?} does not support INTERSECT ALL", ctx.dialect))
-                    .push_hint("providing more column information will allow the query to be translated to an anti-join."));
-            } else {
-                // Don't create Intersect, fallback to inner join.
-                continue;
-            }
-        }
-
-        // remove "used up transforms"
-        let join = res.pop(); // join
-        let (_, with, _) = join.unwrap().into_join().unwrap();
-
-        if distinct {
-            if let Some(Distinct) = &res.last() {
-                res.pop();
-            }
-            if let Some(SqlTransform::Distinct) = pipeline.peek() {
-                pipeline.next();
-            }
-        }
-
-        // push the new transform
-        res.push(SqlTransform::Intersect {
-            bottom: with,
-            distinct,
-        });
-    }
-
-    Ok(res)
-}
-
-/// Returns true if all cids are in exprs
-fn all_in(cids: &[CId], exprs: Vec<&Expr>) -> bool {
-    let exprs = col_refs(exprs);
-    cids.iter().all(|c| exprs.contains(c))
-}
-
-fn all_null(exprs: Vec<&Expr>) -> bool {
-    exprs
-        .iter()
-        .all(|e| matches!(e.kind, ExprKind::Literal(Literal::Null)))
-}
-
-/// Converts `(a == b) and ((c == d) and (e == f))`
-/// into `([a, c, e], [b, d, f])`
-fn collect_equals(expr: &Expr) -> Result<(Vec<&Expr>, Vec<&Expr>)> {
-    let mut lefts = Vec::new();
-    let mut rights = Vec::new();
-
-    match &expr.kind {
-        ExprKind::Operator { name, args } if name == "std.eq" && args.len() == 2 => {
-            lefts.push(&args[0]);
-            rights.push(&args[1]);
-        }
-        ExprKind::Operator { name, args } if name == "std.and" && args.len() == 2 => {
-            let (l, r) = collect_equals(&args[0])?;
-            lefts.extend(l);
-            rights.extend(r);
-
-            let (l, r) = collect_equals(&args[1])?;
-            lefts.extend(l);
-            rights.extend(r);
-        }
-        _ => (),
-    }
-
-    Ok((lefts, rights))
-}
-
-fn col_refs(exprs: Vec<&Expr>) -> Vec<CId> {
-    exprs
-        .into_iter()
-        .flat_map(|expr| expr.kind.as_column_ref().cloned())
-        .collect()
 }
 
 /// Pull Compute transforms in front of other transforms if possible.

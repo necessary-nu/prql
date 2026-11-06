@@ -19,14 +19,6 @@ WITH table_0 AS (
   SELECT
     3 AS a
 ),
-table_1 AS (
-  SELECT
-    1 AS a
-  UNION
-  ALL
-  SELECT
-    2 AS a
-),
 table_2 AS (
   SELECT
     a
@@ -37,7 +29,14 @@ table_2 AS (
   SELECT
     *
   FROM
-    table_1
+    (
+      SELECT
+        1 AS a
+      UNION
+      ALL
+      SELECT
+        2 AS a
+    ) AS table_4
 )
 SELECT
   a

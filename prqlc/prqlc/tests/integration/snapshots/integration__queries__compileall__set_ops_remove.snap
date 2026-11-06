@@ -5,10 +5,10 @@ input_file: prqlc/prqlc/tests/integration/queries/set_ops_remove.prql
 ---
 --- generic
 +++ mssql
-@@ -21,21 +21,20 @@
+@@ -13,21 +13,20 @@
    ALL
    SELECT
-     2 AS a
+     3 AS a
  ),
  table_2 AS (
    SELECT
@@ -20,20 +20,90 @@ input_file: prqlc/prqlc/tests/integration/queries/set_ops_remove.prql
    SELECT
      *
    FROM
-     table_1
+     (
+       SELECT
+         1 AS a
+       UNION
+       ALL
+       SELECT
+         2 AS a
+
+--- generic
++++ postgres
+@@ -13,29 +13,25 @@
+   ALL
+   SELECT
+     3 AS a
+ ),
+ table_2 AS (
+   SELECT
+     a
+   FROM
+     table_0
+   EXCEPT
+-    DISTINCT
+-  SELECT
+-    *
+-  FROM
+-    (
++    DISTINCT (
+       SELECT
+         1 AS a
+       UNION
+       ALL
+       SELECT
+         2 AS a
+-    ) AS table_4
++    )
  )
  SELECT
    a
  FROM
    table_2
  ORDER BY
+   a
+
+--- generic
++++ redshift
+@@ -13,29 +13,25 @@
+   ALL
+   SELECT
+     3 AS a
+ ),
+ table_2 AS (
+   SELECT
+     a
+   FROM
+     table_0
+   EXCEPT
+-    DISTINCT
+-  SELECT
+-    *
+-  FROM
+-    (
++    DISTINCT (
+       SELECT
+         1 AS a
+       UNION
+       ALL
+       SELECT
+         2 AS a
+-    ) AS table_4
++    )
+ )
+ SELECT
+   a
+ FROM
+   table_2
+ ORDER BY
+   a
 
 --- generic
 +++ sqlite
-@@ -21,21 +21,20 @@
+@@ -13,21 +13,20 @@
    ALL
    SELECT
-     2 AS a
+     3 AS a
  ),
  table_2 AS (
    SELECT
@@ -45,10 +115,10 @@ input_file: prqlc/prqlc/tests/integration/queries/set_ops_remove.prql
    SELECT
      *
    FROM
-     table_1
- )
- SELECT
-   a
- FROM
-   table_2
- ORDER BY
+     (
+       SELECT
+         1 AS a
+       UNION
+       ALL
+       SELECT
+         2 AS a

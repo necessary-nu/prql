@@ -5,10 +5,10 @@ expression: "from employees_1\nintersect employees_2\n"
 SELECT
   *
 FROM
-  employees_1 AS t
+  employees_1
 INTERSECT
 ALL
 SELECT
   *
 FROM
-  employees_2 AS b
+  employees_2
