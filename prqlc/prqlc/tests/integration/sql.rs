@@ -787,13 +787,13 @@ fn test_remove_01() {
     SELECT
       *
     FROM
-      albums AS t
+      albums
     EXCEPT
       ALL
     SELECT
       *
     FROM
-      artists AS b
+      artists
     "
     );
 }
@@ -808,13 +808,6 @@ fn test_remove_02() {
     )
     "#).unwrap(),
         @"
-    WITH
-    table_0 AS (
-      SELECT
-        artist_id
-      FROM
-        artist
-    )
     SELECT
       artist_id
     FROM
@@ -822,38 +815,34 @@ fn test_remove_02() {
     EXCEPT
       ALL
     SELECT
-      *
+      artist_id
     FROM
-      table_0
+      artist
     "
     );
 }
 
 #[test]
 fn test_remove_03() {
+    // Upstream pairs the positions the two operands share and anti-joins on
+    // them; here `remove` is `EXCEPT ALL`, whose operands must match.
     assert_snapshot!(compile(r#"
     from album
     select {artist_id, title}
     remove (
         from artist | select artist_id
     )
-    "#).unwrap(),
+    "#).unwrap_err(),
         @"
-    WITH
-    table_0 AS (
-      SELECT
-        artist_id
-      FROM
-        artist
-    )
-    SELECT
-      album.artist_id,
-      album.title
-    FROM
-      album
-      LEFT OUTER JOIN table_0 ON album.artist_id = table_0.artist_id
-    WHERE
-      table_0.artist_id IS NULL
+    Error:
+       ╭─[ :3:5 ]
+       │
+     3 │     select {artist_id, title}
+       │     ────────────┬────────────
+       │                 ╰────────────── cannot combine relations with different numbers of columns
+       │
+       │ Help: `remove` requires both tables to have matching columns
+    ───╯
     "
     );
 }
@@ -868,7 +857,6 @@ fn test_remove_04() {
     "#).unwrap_err(),
         @"
     Error: The dialect SQLiteDialect does not support EXCEPT ALL
-    ↳ Hint: providing more column information will allow the query to be translated to an anti-join.
     "
     );
 }
@@ -886,14 +874,6 @@ fn test_remove_05() {
     except (from artist | select {artist_id, name})
     "#).unwrap(),
         @"
-    WITH
-    table_0 AS (
-      SELECT
-        artist_id,
-        name
-      FROM
-        artist
-    )
     SELECT
       artist_id,
       title
@@ -901,9 +881,10 @@ fn test_remove_05() {
       album
     EXCEPT
     SELECT
-      *
+      artist_id,
+      name
     FROM
-      table_0
+      artist
     "
     );
 }
@@ -928,7 +909,7 @@ fn test_remove_06() {
     SELECT
       *
     FROM
-      artist AS b
+      artist
     "
     );
 }
@@ -943,12 +924,12 @@ fn test_intersect_01() {
     SELECT
       *
     FROM
-      album AS t
+      album
     INTERSECT ALL
     SELECT
       *
     FROM
-      artist AS b
+      artist
     "
     );
 }
@@ -963,22 +944,15 @@ fn test_intersect_02() {
     )
     "#).unwrap(),
         @"
-    WITH
-    table_0 AS (
-      SELECT
-        artist_id
-      FROM
-        artist
-    )
     SELECT
       artist_id
     FROM
       album
     INTERSECT ALL
     SELECT
-      *
+      artist_id
     FROM
-      table_0
+      artist
     "
     );
 }
@@ -997,29 +971,16 @@ fn test_intersect_03() {
     distinct
     "#).unwrap(),
         @"
-    WITH
-    table_0 AS (
-      SELECT
-        artist_id
-      FROM
-        artist
-    ),
-    table_1 AS (
-      SELECT
-        artist_id
-      FROM
-        album
-      INTERSECT
-      DISTINCT
-      SELECT
-        *
-      FROM
-        table_0
-    )
-    SELECT DISTINCT
+    SELECT
       artist_id
     FROM
-      table_1
+      album
+    INTERSECT
+    DISTINCT
+    SELECT
+      artist_id
+    FROM
+      artist
     "
     );
 }
@@ -1037,28 +998,16 @@ fn test_intersect_04() {
     distinct
     "#).unwrap(),
         @"
-    WITH
-    table_0 AS (
-      SELECT
-        artist_id
-      FROM
-        artist
-    ),
-    table_1 AS (
-      SELECT
-        artist_id
-      FROM
-        album
-      INTERSECT ALL
-      SELECT
-        *
-      FROM
-        table_0
-    )
-    SELECT DISTINCT
+    SELECT
       artist_id
     FROM
-      table_1
+      album
+    INTERSECT
+    DISTINCT
+    SELECT
+      artist_id
+    FROM
+      artist
     "
     );
 }
@@ -1076,13 +1025,6 @@ fn test_intersect_05() {
     )
     "#).unwrap(),
         @"
-    WITH
-    table_0 AS (
-      SELECT
-        artist_id
-      FROM
-        artist
-    )
     SELECT
       artist_id
     FROM
@@ -1090,9 +1032,9 @@ fn test_intersect_05() {
     INTERSECT
     DISTINCT
     SELECT
-      *
+      artist_id
     FROM
-      table_0
+      artist
     "
     );
 }
@@ -1107,7 +1049,6 @@ fn test_intersect_06() {
     "#).unwrap_err(),
         @"
     Error: The dialect SQLiteDialect does not support INTERSECT ALL
-    ↳ Hint: providing more column information will allow the query to be translated to an anti-join.
     "
     );
 }
@@ -1313,11 +1254,11 @@ fn test_remove_07() {
 }
 
 #[test]
-fn test_intersect_all_of_wildcards_read_after() {
+fn test_intersect_of_wildcards_read_after() {
     // A column read from the result is inferred into the top table, which
     // the operation never has to expand.
     assert_snapshot!(compile(r#"
-    let both = (from album | _intersect_all artist)
+    let both = (from album | intersect artist)
     from both
     filter artist_id > 3
     select {artist_id, title}
@@ -1346,9 +1287,9 @@ fn test_intersect_all_of_wildcards_read_after() {
 }
 
 #[test]
-fn test_except_all_of_wildcards_grouped_after() {
+fn test_remove_of_wildcards_grouped_after() {
     assert_snapshot!(compile(r#"
-    let rest = (from album | _except_all artist)
+    let rest = (from album | remove artist)
     from rest
     group {artist_id} (aggregate {n = count this})
     "#).unwrap(),
@@ -1377,13 +1318,13 @@ fn test_except_all_of_wildcards_grouped_after() {
 }
 
 #[test]
-fn test_intersect_all_keeps_the_top_columns() {
+fn test_intersect_keeps_the_top_columns() {
     // A derived column stays in the top operand rather than being dropped by a
     // join over the positions both operands share.
     assert_snapshot!(compile(r#"
     from album
     derive {k = 1}
-    _intersect_all artist
+    intersect artist
     "#).unwrap(),
         @"
     SELECT
@@ -1406,9 +1347,9 @@ fn test_set_operations_of_operands_inferred_apart() {
     assert_snapshot!(compile(r#"
     let cheap = (from album | filter price < 4)
     let both = (from album | filter year > 2000 | append cheap)
-    let shared = (from album | filter year > 2000 | _intersect_all cheap)
+    let shared = (from album | filter year > 2000 | intersect cheap)
     from both
-    _except_all shared
+    remove shared
     "#).unwrap(),
         @r#"
     WITH
@@ -1455,11 +1396,11 @@ fn test_set_operations_of_operands_inferred_apart() {
 }
 
 #[test]
-fn test_intersect_all_column_count_mismatch() {
+fn test_intersect_column_count_mismatch() {
     assert_snapshot!(compile(r#"
     from album
     select {artist_id, title}
-    _intersect_all (from artist | select artist_id)
+    intersect (from artist | select artist_id)
     "#).unwrap_err(),
         @"
     Error:
@@ -1469,17 +1410,17 @@ fn test_intersect_all_column_count_mismatch() {
        │     ────────────┬────────────
        │                 ╰────────────── cannot combine relations with different numbers of columns
        │
-       │ Help: `_intersect_all` requires both tables to have matching columns
+       │ Help: `intersect` requires both tables to have matching columns
     ───╯
     ");
 }
 
 #[test]
-fn test_except_all_column_count_mismatch() {
+fn test_remove_column_count_mismatch() {
     assert_snapshot!(compile(r#"
     from album
     select {artist_id, title}
-    _except_all (from artist | select artist_id)
+    remove (from artist | select artist_id)
     "#).unwrap_err(),
         @"
     Error:
@@ -1489,7 +1430,7 @@ fn test_except_all_column_count_mismatch() {
        │     ────────────┬────────────
        │                 ╰────────────── cannot combine relations with different numbers of columns
        │
-       │ Help: `_except_all` requires both tables to have matching columns
+       │ Help: `remove` requires both tables to have matching columns
     ───╯
     ");
 }
@@ -1499,7 +1440,7 @@ fn test_set_operations_distinct() {
     assert_snapshot!(compile(r#"
     from album
     select {artist_id}
-    _intersect_all (from artist | select artist_id)
+    intersect (from artist | select artist_id)
     group {artist_id} (take 1)
     "#).unwrap(),
         @"
@@ -1519,7 +1460,7 @@ fn test_set_operations_distinct() {
     assert_snapshot!(compile(r#"
     from album
     select {artist_id}
-    _except_all (from artist | select artist_id)
+    remove (from artist | select artist_id)
     group {artist_id} (take 1)
     "#).unwrap(),
         @"
@@ -1553,7 +1494,7 @@ fn test_set_operation_operands_keep_their_grouping() {
 
     let rest = (from b | append c)
     from a
-    _except_all rest
+    remove rest
     "#).unwrap(),
         @"
     SELECT
@@ -1578,7 +1519,7 @@ fn test_set_operation_operands_keep_their_grouping() {
 
     from a
     append b
-    _intersect_all c
+    intersect c
     "#).unwrap(),
         @"
     (
@@ -1602,7 +1543,7 @@ fn test_set_operation_operands_keep_their_grouping() {
     prql target:sql.postgres
 
     from a
-    _intersect_all b
+    intersect b
     append c
     "#).unwrap(),
         @"
@@ -1620,19 +1561,6 @@ fn test_set_operation_operands_keep_their_grouping() {
       *
     FROM
       c
-    ");
-}
-
-#[test]
-fn test_except_all_sqlite() {
-    assert_snapshot!(compile(r#"
-    prql target:sql.sqlite
-
-    from album
-    _except_all artist
-    "#).unwrap_err(),
-        @"
-    Error: The dialect SQLiteDialect does not support EXCEPT ALL
     ");
 }
 
