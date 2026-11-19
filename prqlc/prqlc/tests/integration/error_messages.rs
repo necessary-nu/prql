@@ -296,7 +296,7 @@ fn date_trunc_with_column_unit() {
 }
 
 #[test]
-fn date_to_text_unsupported_chrono_item() {
+fn date_to_text_unsupported_format_item() {
     assert_snapshot!(compile(r#"
     prql target:sql.duckdb
 

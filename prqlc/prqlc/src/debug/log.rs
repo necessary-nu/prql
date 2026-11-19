@@ -1,10 +1,10 @@
 //! Internal machinery for collecting and rendering debug logs.
 #![doc(hidden)]
 
-use chrono::prelude::*;
+use jiff::Timestamp;
 use serde::Serialize;
 use std::marker::PhantomData;
-use std::{sync::RwLock, time::SystemTime};
+use std::sync::RwLock;
 use strum_macros::AsRefStr;
 
 use crate::ir::{decl, pl, rq};
@@ -20,16 +20,27 @@ pub fn log_start() {
     let mut lock = CURRENT_LOG.write().unwrap();
     assert!(lock.is_none());
 
-    let started_at: DateTime<Utc> = SystemTime::now().into();
-    let started_at = format!("{}", started_at.format("%+"));
-
     *lock = Some(DebugLog {
-        started_at,
+        started_at: rfc3339(Timestamp::now()),
         version: crate::compiler_version().to_string(),
         entries: Vec::new(),
 
         suppress_count: 0,
     });
+}
+
+/// A timestamp in RFC 3339 at UTC, written `+00:00`, with as many groups of
+/// three fractional digits as its nanoseconds need.
+fn rfc3339(timestamp: Timestamp) -> String {
+    let fraction = match timestamp.subsec_nanosecond() {
+        0 => "",
+        nanos if nanos % 1_000_000 == 0 => "%.3f",
+        nanos if nanos % 1_000 == 0 => "%.6f",
+        _ => "%.9f",
+    };
+    timestamp
+        .strftime(&format!("%Y-%m-%dT%H:%M:%S{fraction}%:z"))
+        .to_string()
 }
 
 pub fn log_finish() -> Option<DebugLog> {
@@ -170,5 +181,22 @@ impl Drop for LogSuppressLock {
         if let Some(log) = lock.as_mut() {
             log.suppress_count -= 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::Timestamp;
+
+    use super::rfc3339;
+
+    #[test]
+    fn started_at_is_rfc3339() {
+        let at = |nanos| rfc3339(Timestamp::new(1_700_000_000, nanos).unwrap());
+        assert_eq!(at(0), "2023-11-14T22:13:20+00:00");
+        assert_eq!(at(120_000_000), "2023-11-14T22:13:20.120+00:00");
+        assert_eq!(at(123_456_000), "2023-11-14T22:13:20.123456+00:00");
+        assert_eq!(at(123_456_789), "2023-11-14T22:13:20.123456789+00:00");
+        assert_eq!(at(100), "2023-11-14T22:13:20.000000100+00:00");
     }
 }

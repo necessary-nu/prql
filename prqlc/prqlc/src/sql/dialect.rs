@@ -14,20 +14,20 @@
 use core::fmt::Debug;
 use std::any::{Any, TypeId};
 
-use chrono::format::{Fixed, Item, Numeric, Pad, StrftimeItems};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::DateTimeField;
 use strum::VariantNames;
 
+use super::strftime::{self, Fixed, Item, Numeric, Pad};
 use crate::{Error, Result};
 
-/// Convert a chrono format `Item` back to its strftime string representation,
-/// or `None` where there is no spelling to give back.
+/// Convert a format `Item` back to its strftime string representation, or
+/// `None` where there is no spelling to give back.
 ///
 /// The result is shown to users in error messages, so an item we can't name
-/// has to be `None` rather than its `Debug` form — chrono's variant names
+/// has to be `None` rather than its `Debug` form — the variant names
 /// (`Ordinal`, `TimezoneOffsetColon`) aren't anything a PRQL author typed.
-fn chrono_item_to_strftime(item: &Item) -> Option<String> {
+fn item_to_strftime(item: &Item) -> Option<String> {
     let pad_char = |pad: &Pad| match pad {
         Pad::None => "-",
         Pad::Zero => "",
@@ -64,17 +64,18 @@ fn chrono_item_to_strftime(item: &Item) -> Option<String> {
 /// format string, so `"%d %P"` otherwise gives no clue which of the two the
 /// dialect rejected.
 ///
-/// The name is chrono's canonical spelling of the parsed item, not the text
-/// that was typed — chrono discards the source offsets, so `%e` (its own
-/// documented alias for `%_d`) is reported as `%_d`. Both name the same
+/// The name is the canonical spelling of the parsed item, not the text that
+/// was typed — an item keeps no source offsets, so `%e` (documented as an
+/// alias for `%_d`) is reported as `%_d`. Both name the same
 /// specifier, and the alternative is the generic message that names none.
 fn unsupported_format_specifier(item: &Item, dialect: &str) -> Error {
-    // chrono parses a `%` escape it doesn't recognize into `Item::Error`, so
+    // `strftime::items` parses a `%` escape it doesn't recognize into
+    // `Item::Error`, so
     // the format string is malformed rather than beyond this dialect's reach.
     if matches!(item, Item::Error) {
         return Error::new_simple("date format string contains an unrecognized specifier");
     }
-    match chrono_item_to_strftime(item) {
+    match item_to_strftime(item) {
         Some(specifier) => Error::new_simple(format!(
             "format specifier `{specifier}` is not supported for {dialect}"
         )),
@@ -317,13 +318,14 @@ pub(super) trait DialectHandler: Any + Debug {
     /// PRQL uses the same format as `chrono` crate
     /// (see https://docs.rs/chrono/latest/chrono/format/strftime/index.html)
     fn translate_prql_date_format(&self, prql_date_format: &str) -> Result<String> {
-        Ok(StrftimeItems::new(prql_date_format)
-            .map(|item| self.translate_chrono_item(item))
+        Ok(strftime::items(prql_date_format)
+            .into_iter()
+            .map(|item| self.translate_format_item(item))
             .collect::<Result<Vec<_>>>()?
             .join(""))
     }
 
-    fn translate_chrono_item(&self, _item: Item) -> Result<String> {
+    fn translate_format_item(&self, _item: Item) -> Result<String> {
         Err(Error::new_simple(
             "Date formatting is not yet supported for this dialect",
         ))
@@ -367,7 +369,7 @@ impl dyn DialectHandler {
 }
 
 impl DialectHandler for GenericDialect {
-    fn translate_chrono_item(&self, _item: Item) -> Result<String> {
+    fn translate_format_item(&self, _item: Item) -> Result<String> {
         Err(Error::new_simple("Date formatting requires a dialect"))
     }
 }
@@ -389,7 +391,7 @@ impl DialectHandler for PostgresDialect {
     }
 
     // https://www.postgresql.org/docs/current/functions-formatting.html
-    fn translate_chrono_item(&self, item: Item) -> Result<String> {
+    fn translate_format_item(&self, item: Item) -> Result<String> {
         Ok(match item {
             Item::Numeric(Numeric::Year, Pad::Zero) => "YYYY".to_string(),
             Item::Numeric(Numeric::YearMod100, Pad::Zero) => "YY".to_string(),
@@ -415,7 +417,7 @@ impl DialectHandler for PostgresDialect {
                     // If the literal contains alphanumeric characters, we need to quote it
                     // to avoid it being interpreted as a pattern understood by Postgres.
                     // We hence need to put it in double quotes to force it to be interpreted as literal text.
-                    // chrono can keep a `"` or `\` inside such a literal (e.g. `x"y`).
+                    // Such a literal can hold a `"` or `\` (e.g. `x"y`).
                     // Inside the quoted section a backslash escapes the next character,
                     // so escape backslashes first, then the `"` that would close it early.
                     format!("\"{}\"", literal.replace('\\', "\\\\").replace('"', "\\\""))
@@ -447,7 +449,7 @@ impl DialectHandler for RedshiftDialect {
     }
 
     // https://docs.aws.amazon.com/redshift/latest/dg/r_FORMAT_strings.html
-    fn translate_chrono_item(&self, item: Item) -> Result<String> {
+    fn translate_format_item(&self, item: Item) -> Result<String> {
         Ok(match item {
             Item::Numeric(Numeric::Year, Pad::Zero) => "YYYY".to_string(),
             Item::Numeric(Numeric::YearMod100, Pad::Zero) => "YY".to_string(),
@@ -473,7 +475,7 @@ impl DialectHandler for RedshiftDialect {
                     // If the literal contains alphanumeric characters, we need to quote it
                     // to avoid it being interpreted as a pattern understood by Redshift.
                     // We hence need to put it in double quotes to force it to be interpreted as literal text.
-                    // chrono can keep a `"` or `\` inside such a literal (e.g. `x"y`).
+                    // Such a literal can hold a `"` or `\` (e.g. `x"y`).
                     // Inside the quoted section a backslash escapes the next character,
                     // so escape backslashes first, then the `"` that would close it early.
                     format!("\"{}\"", literal.replace('\\', "\\\\").replace('"', "\\\""))
@@ -548,7 +550,7 @@ impl DialectHandler for MsSqlDialect {
     }
 
     // https://learn.microsoft.com/en-us/dotnet/standard/base-types/custom-date-and-time-format-strings
-    fn translate_chrono_item(&self, item: Item) -> Result<String> {
+    fn translate_format_item(&self, item: Item) -> Result<String> {
         Ok(match item {
             Item::Numeric(Numeric::Year, Pad::Zero) => "yyyy".to_string(),
             Item::Numeric(Numeric::YearMod100, Pad::Zero) => "yy".to_string(),
@@ -573,7 +575,7 @@ impl DialectHandler for MsSqlDialect {
                     // If the literal contains alphanumeric characters, we need to quote it
                     // to avoid it being interpreted as a pattern understood by MSSQL.
                     // We hence need to put it in double quotes to force it to be interpreted as literal text.
-                    // chrono can keep a `"` or `\` inside such a literal (e.g. `x"y`).
+                    // Such a literal can hold a `"` or `\` (e.g. `x"y`).
                     // Inside the quoted section a backslash escapes the next character,
                     // so escape backslashes first, then the `"` that would close it early.
                     format!("\"{}\"", literal.replace('\\', "\\\\").replace('"', "\\\""))
@@ -604,7 +606,7 @@ impl DialectHandler for MySqlDialect {
     }
 
     // https://dev.mysql.com/doc/refman/8.0/en/date-and-time-functions.html#function_date-format
-    fn translate_chrono_item(&self, item: Item) -> Result<String> {
+    fn translate_format_item(&self, item: Item) -> Result<String> {
         Ok(match item {
             Item::Numeric(Numeric::Year, Pad::Zero) => "%Y".to_string(),
             Item::Numeric(Numeric::YearMod100, Pad::Zero) => "%y".to_string(),
@@ -641,7 +643,7 @@ impl DialectHandler for ClickHouseDialect {
     }
 
     // https://clickhouse.com/docs/en/sql-reference/functions/date-time-functions#formatDateTimeInJodaSyntax
-    fn translate_chrono_item(&self, item: Item) -> Result<String> {
+    fn translate_format_item(&self, item: Item) -> Result<String> {
         Ok(match item {
             Item::Numeric(Numeric::Year, Pad::Zero) => "yyyy".to_string(),
             Item::Numeric(Numeric::YearMod100, Pad::Zero) => "yy".to_string(),
@@ -710,7 +712,7 @@ impl DialectHandler for BigQueryDialect {
     }
 
     // https://cloud.google.com/bigquery/docs/reference/standard-sql/format-elements#format_elements_date_time
-    fn translate_chrono_item(&self, item: Item) -> Result<String> {
+    fn translate_format_item(&self, item: Item) -> Result<String> {
         Ok(match item {
             Item::Numeric(Numeric::Year, Pad::Zero) => "%Y".to_string(),
             Item::Numeric(Numeric::YearMod100, Pad::Zero) => "%y".to_string(),
@@ -779,7 +781,7 @@ impl DialectHandler for DuckDbDialect {
     }
 
     // https://duckdb.org/docs/sql/functions/dateformat
-    fn translate_chrono_item(&self, item: Item) -> Result<String> {
+    fn translate_format_item(&self, item: Item) -> Result<String> {
         Ok(match item {
             Item::Numeric(Numeric::Year, Pad::Zero) => "%Y".to_string(),
             Item::Numeric(Numeric::YearMod100, Pad::Zero) => "%y".to_string(),
@@ -830,13 +832,14 @@ impl DialectHandler for OracleDialect {
 mod tests {
     use std::str::FromStr;
 
-    use chrono::format::{Fixed, Item, Numeric, Pad};
     use insta::{assert_debug_snapshot, assert_snapshot};
 
     use super::{
-        chrono_item_to_strftime, BigQueryDialect, ClickHouseDialect, Dialect, DialectHandler,
-        DuckDbDialect, MsSqlDialect, MySqlDialect, PostgresDialect, RedshiftDialect,
+        item_to_strftime, BigQueryDialect, ClickHouseDialect, Dialect, DialectHandler,
+        DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgresDialect,
+        RedshiftDialect, SQLiteDialect,
     };
+    use crate::sql::strftime::{Fixed, Item, Numeric, Pad};
 
     #[test]
     fn test_dialect_from_str() {
@@ -853,100 +856,100 @@ mod tests {
         ");
     }
 
-    // -- chrono_item_to_strftime tests --
+    // -- item_to_strftime tests --
 
     #[test]
-    fn chrono_item_to_strftime_numerics_zero_pad() {
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Year, Pad::Zero)).unwrap(), @"%Y");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::YearMod100, Pad::Zero)).unwrap(), @"%y");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Month, Pad::Zero)).unwrap(), @"%m");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Day, Pad::Zero)).unwrap(), @"%d");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Hour, Pad::Zero)).unwrap(), @"%H");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Hour12, Pad::Zero)).unwrap(), @"%I");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Minute, Pad::Zero)).unwrap(), @"%M");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Second, Pad::Zero)).unwrap(), @"%S");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Nanosecond, Pad::Zero)).unwrap(), @"%f");
+    fn item_to_strftime_numerics_zero_pad() {
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Year, Pad::Zero)).unwrap(), @"%Y");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::YearMod100, Pad::Zero)).unwrap(), @"%y");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Month, Pad::Zero)).unwrap(), @"%m");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Day, Pad::Zero)).unwrap(), @"%d");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Hour, Pad::Zero)).unwrap(), @"%H");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Hour12, Pad::Zero)).unwrap(), @"%I");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Minute, Pad::Zero)).unwrap(), @"%M");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Second, Pad::Zero)).unwrap(), @"%S");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Nanosecond, Pad::Zero)).unwrap(), @"%f");
     }
 
     #[test]
-    fn chrono_item_to_strftime_numerics_no_pad() {
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Day, Pad::None)).unwrap(), @"%-d");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Month, Pad::None)).unwrap(), @"%-m");
+    fn item_to_strftime_numerics_no_pad() {
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Day, Pad::None)).unwrap(), @"%-d");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Month, Pad::None)).unwrap(), @"%-m");
     }
 
     #[test]
-    fn chrono_item_to_strftime_numerics_space_pad() {
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Day, Pad::Space)).unwrap(), @"%_d");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Numeric(Numeric::Hour, Pad::Space)).unwrap(), @"%_H");
+    fn item_to_strftime_numerics_space_pad() {
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Day, Pad::Space)).unwrap(), @"%_d");
+        assert_snapshot!(item_to_strftime(&Item::Numeric(Numeric::Hour, Pad::Space)).unwrap(), @"%_H");
     }
 
     #[test]
-    fn chrono_item_to_strftime_numeric_unknown() {
+    fn item_to_strftime_numeric_unknown() {
         // Numeric variants not in the explicit list have no spelling to give back
-        assert!(chrono_item_to_strftime(&Item::Numeric(Numeric::Ordinal, Pad::Zero)).is_none());
+        assert!(item_to_strftime(&Item::Numeric(Numeric::Ordinal, Pad::Zero)).is_none());
     }
 
     #[test]
-    fn chrono_item_to_strftime_fixed() {
-        assert_snapshot!(chrono_item_to_strftime(&Item::Fixed(Fixed::ShortMonthName)).unwrap(), @"%b");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Fixed(Fixed::LongMonthName)).unwrap(), @"%B");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Fixed(Fixed::ShortWeekdayName)).unwrap(), @"%a");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Fixed(Fixed::LongWeekdayName)).unwrap(), @"%A");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Fixed(Fixed::UpperAmPm)).unwrap(), @"%p");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Fixed(Fixed::LowerAmPm)).unwrap(), @"%P");
-        assert_snapshot!(chrono_item_to_strftime(&Item::Fixed(Fixed::RFC3339)).unwrap(), @"%+");
+    fn item_to_strftime_fixed() {
+        assert_snapshot!(item_to_strftime(&Item::Fixed(Fixed::ShortMonthName)).unwrap(), @"%b");
+        assert_snapshot!(item_to_strftime(&Item::Fixed(Fixed::LongMonthName)).unwrap(), @"%B");
+        assert_snapshot!(item_to_strftime(&Item::Fixed(Fixed::ShortWeekdayName)).unwrap(), @"%a");
+        assert_snapshot!(item_to_strftime(&Item::Fixed(Fixed::LongWeekdayName)).unwrap(), @"%A");
+        assert_snapshot!(item_to_strftime(&Item::Fixed(Fixed::UpperAmPm)).unwrap(), @"%p");
+        assert_snapshot!(item_to_strftime(&Item::Fixed(Fixed::LowerAmPm)).unwrap(), @"%P");
+        assert_snapshot!(item_to_strftime(&Item::Fixed(Fixed::RFC3339)).unwrap(), @"%+");
     }
 
     #[test]
-    fn chrono_item_to_strftime_fixed_unknown() {
+    fn item_to_strftime_fixed_unknown() {
         // Fixed variants not in the explicit list have no spelling to give back
-        assert!(chrono_item_to_strftime(&Item::Fixed(Fixed::TimezoneOffsetColon)).is_none());
+        assert!(item_to_strftime(&Item::Fixed(Fixed::TimezoneOffsetColon)).is_none());
     }
 
     #[test]
-    fn chrono_item_to_strftime_non_numeric_non_fixed() {
+    fn item_to_strftime_non_numeric_non_fixed() {
         // Literal and Space items aren't specifiers, so they have no spelling
-        assert!(chrono_item_to_strftime(&Item::Literal("-")).is_none());
-        assert!(chrono_item_to_strftime(&Item::Space(" ")).is_none());
-        // chrono's stand-in for an unrecognized `%` escape
-        assert!(chrono_item_to_strftime(&Item::Error).is_none());
+        assert!(item_to_strftime(&Item::Literal("-")).is_none());
+        assert!(item_to_strftime(&Item::Space(" ")).is_none());
+        // the stand-in for an unrecognized `%` escape
+        assert!(item_to_strftime(&Item::Error).is_none());
     }
 
-    // -- BigQueryDialect::translate_chrono_item tests --
+    // -- BigQueryDialect::translate_format_item tests --
 
     #[test]
     fn bigquery_translate_numeric_specifiers() {
         let bq = BigQueryDialect;
-        assert_snapshot!(bq.translate_chrono_item(Item::Numeric(Numeric::Year, Pad::Zero)).unwrap(), @"%Y");
-        assert_snapshot!(bq.translate_chrono_item(Item::Numeric(Numeric::YearMod100, Pad::Zero)).unwrap(), @"%y");
-        assert_snapshot!(bq.translate_chrono_item(Item::Numeric(Numeric::Month, Pad::Zero)).unwrap(), @"%m");
-        assert_snapshot!(bq.translate_chrono_item(Item::Numeric(Numeric::Day, Pad::Zero)).unwrap(), @"%d");
-        assert_snapshot!(bq.translate_chrono_item(Item::Numeric(Numeric::Hour, Pad::Zero)).unwrap(), @"%H");
-        assert_snapshot!(bq.translate_chrono_item(Item::Numeric(Numeric::Hour12, Pad::Zero)).unwrap(), @"%I");
-        assert_snapshot!(bq.translate_chrono_item(Item::Numeric(Numeric::Minute, Pad::Zero)).unwrap(), @"%M");
-        assert_snapshot!(bq.translate_chrono_item(Item::Numeric(Numeric::Second, Pad::Zero)).unwrap(), @"%S");
+        assert_snapshot!(bq.translate_format_item(Item::Numeric(Numeric::Year, Pad::Zero)).unwrap(), @"%Y");
+        assert_snapshot!(bq.translate_format_item(Item::Numeric(Numeric::YearMod100, Pad::Zero)).unwrap(), @"%y");
+        assert_snapshot!(bq.translate_format_item(Item::Numeric(Numeric::Month, Pad::Zero)).unwrap(), @"%m");
+        assert_snapshot!(bq.translate_format_item(Item::Numeric(Numeric::Day, Pad::Zero)).unwrap(), @"%d");
+        assert_snapshot!(bq.translate_format_item(Item::Numeric(Numeric::Hour, Pad::Zero)).unwrap(), @"%H");
+        assert_snapshot!(bq.translate_format_item(Item::Numeric(Numeric::Hour12, Pad::Zero)).unwrap(), @"%I");
+        assert_snapshot!(bq.translate_format_item(Item::Numeric(Numeric::Minute, Pad::Zero)).unwrap(), @"%M");
+        assert_snapshot!(bq.translate_format_item(Item::Numeric(Numeric::Second, Pad::Zero)).unwrap(), @"%S");
     }
 
     #[test]
     fn bigquery_translate_fixed_specifiers() {
         let bq = BigQueryDialect;
-        assert_snapshot!(bq.translate_chrono_item(Item::Fixed(Fixed::ShortMonthName)).unwrap(), @"%b");
-        assert_snapshot!(bq.translate_chrono_item(Item::Fixed(Fixed::LongMonthName)).unwrap(), @"%B");
-        assert_snapshot!(bq.translate_chrono_item(Item::Fixed(Fixed::ShortWeekdayName)).unwrap(), @"%a");
-        assert_snapshot!(bq.translate_chrono_item(Item::Fixed(Fixed::LongWeekdayName)).unwrap(), @"%A");
-        assert_snapshot!(bq.translate_chrono_item(Item::Fixed(Fixed::UpperAmPm)).unwrap(), @"%p");
-        assert_snapshot!(bq.translate_chrono_item(Item::Fixed(Fixed::RFC3339)).unwrap(), @"%Y-%m-%dT%H:%M:%S%Ez");
+        assert_snapshot!(bq.translate_format_item(Item::Fixed(Fixed::ShortMonthName)).unwrap(), @"%b");
+        assert_snapshot!(bq.translate_format_item(Item::Fixed(Fixed::LongMonthName)).unwrap(), @"%B");
+        assert_snapshot!(bq.translate_format_item(Item::Fixed(Fixed::ShortWeekdayName)).unwrap(), @"%a");
+        assert_snapshot!(bq.translate_format_item(Item::Fixed(Fixed::LongWeekdayName)).unwrap(), @"%A");
+        assert_snapshot!(bq.translate_format_item(Item::Fixed(Fixed::UpperAmPm)).unwrap(), @"%p");
+        assert_snapshot!(bq.translate_format_item(Item::Fixed(Fixed::RFC3339)).unwrap(), @"%Y-%m-%dT%H:%M:%S%Ez");
     }
 
     #[test]
     fn bigquery_translate_literal() {
         let bq = BigQueryDialect;
-        assert_snapshot!(bq.translate_chrono_item(Item::Literal("-")).unwrap(), @"-");
-        assert_snapshot!(bq.translate_chrono_item(Item::Literal("/")).unwrap(), @"/");
+        assert_snapshot!(bq.translate_format_item(Item::Literal("-")).unwrap(), @"-");
+        assert_snapshot!(bq.translate_format_item(Item::Literal("/")).unwrap(), @"/");
         // Single quotes are escaped by doubling
-        assert_snapshot!(bq.translate_chrono_item(Item::Literal("'")).unwrap(), @"''");
+        assert_snapshot!(bq.translate_format_item(Item::Literal("'")).unwrap(), @"''");
         // Percent signs are escaped by doubling
-        assert_snapshot!(bq.translate_chrono_item(Item::Literal("%")).unwrap(), @"%%");
+        assert_snapshot!(bq.translate_format_item(Item::Literal("%")).unwrap(), @"%%");
     }
 
     #[test]
@@ -954,8 +957,8 @@ mod tests {
         let bq = BigQueryDialect;
         // `assert_eq!` rather than an inline snapshot: insta trims trailing
         // whitespace, so a whitespace-only snapshot would also match `""`.
-        assert_eq!(bq.translate_chrono_item(Item::Space(" ")).unwrap(), " ");
-        assert_eq!(bq.translate_chrono_item(Item::Space("  ")).unwrap(), "  ");
+        assert_eq!(bq.translate_format_item(Item::Space(" ")).unwrap(), " ");
+        assert_eq!(bq.translate_format_item(Item::Space("  ")).unwrap(), "  ");
     }
 
     #[test]
@@ -964,28 +967,28 @@ mod tests {
 
         // Nanosecond (%f) is not supported by BigQuery
         let err = bq
-            .translate_chrono_item(Item::Numeric(Numeric::Nanosecond, Pad::Zero))
+            .translate_format_item(Item::Numeric(Numeric::Nanosecond, Pad::Zero))
             .unwrap_err();
         assert_snapshot!(err.to_string(), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%f` is not supported for BigQuery"), hints: [], code: None }"#);
 
         // Non-zero padding is not supported by BigQuery
         let err = bq
-            .translate_chrono_item(Item::Numeric(Numeric::Day, Pad::None))
+            .translate_format_item(Item::Numeric(Numeric::Day, Pad::None))
             .unwrap_err();
         assert_snapshot!(err.to_string(), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%-d` is not supported for BigQuery"), hints: [], code: None }"#);
         let err = bq
-            .translate_chrono_item(Item::Numeric(Numeric::Month, Pad::None))
+            .translate_format_item(Item::Numeric(Numeric::Month, Pad::None))
             .unwrap_err();
         assert_snapshot!(err.to_string(), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%-m` is not supported for BigQuery"), hints: [], code: None }"#);
 
         // LowerAmPm (%P) is not supported by BigQuery
         let err = bq
-            .translate_chrono_item(Item::Fixed(Fixed::LowerAmPm))
+            .translate_format_item(Item::Fixed(Fixed::LowerAmPm))
             .unwrap_err();
         assert_snapshot!(err.to_string(), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%P` is not supported for BigQuery"), hints: [], code: None }"#);
     }
 
-    // -- ClickHouseDialect::translate_chrono_item tests --
+    // -- ClickHouseDialect::translate_format_item tests --
     //
     // ClickHouse formats dates with `formatDateTimeInJodaSyntax`, so specifiers
     // map to Joda pattern letters rather than strftime `%` codes.
@@ -993,57 +996,57 @@ mod tests {
     #[test]
     fn clickhouse_translate_numeric_specifiers() {
         let ch = ClickHouseDialect;
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Year, Pad::Zero)).unwrap(), @"yyyy");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::YearMod100, Pad::Zero)).unwrap(), @"yy");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Month, Pad::None)).unwrap(), @"M");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Month, Pad::Zero)).unwrap(), @"MM");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Day, Pad::None)).unwrap(), @"d");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Day, Pad::Zero)).unwrap(), @"dd");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Hour, Pad::Zero)).unwrap(), @"HH");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Hour12, Pad::Zero)).unwrap(), @"hh");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Minute, Pad::Zero)).unwrap(), @"mm");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Second, Pad::Zero)).unwrap(), @"ss");
-        assert_snapshot!(ch.translate_chrono_item(Item::Numeric(Numeric::Nanosecond, Pad::Zero)).unwrap(), @"SSSSSS");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Year, Pad::Zero)).unwrap(), @"yyyy");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::YearMod100, Pad::Zero)).unwrap(), @"yy");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Month, Pad::None)).unwrap(), @"M");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Month, Pad::Zero)).unwrap(), @"MM");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Day, Pad::None)).unwrap(), @"d");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Day, Pad::Zero)).unwrap(), @"dd");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Hour, Pad::Zero)).unwrap(), @"HH");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Hour12, Pad::Zero)).unwrap(), @"hh");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Minute, Pad::Zero)).unwrap(), @"mm");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Second, Pad::Zero)).unwrap(), @"ss");
+        assert_snapshot!(ch.translate_format_item(Item::Numeric(Numeric::Nanosecond, Pad::Zero)).unwrap(), @"SSSSSS");
     }
 
     #[test]
     fn clickhouse_translate_fixed_specifiers() {
         let ch = ClickHouseDialect;
-        assert_snapshot!(ch.translate_chrono_item(Item::Fixed(Fixed::ShortMonthName)).unwrap(), @"MMM");
-        assert_snapshot!(ch.translate_chrono_item(Item::Fixed(Fixed::LongMonthName)).unwrap(), @"MMMM");
-        assert_snapshot!(ch.translate_chrono_item(Item::Fixed(Fixed::ShortWeekdayName)).unwrap(), @"EEE");
-        assert_snapshot!(ch.translate_chrono_item(Item::Fixed(Fixed::LongWeekdayName)).unwrap(), @"EEEE");
-        assert_snapshot!(ch.translate_chrono_item(Item::Fixed(Fixed::UpperAmPm)).unwrap(), @"aa");
-        assert_snapshot!(ch.translate_chrono_item(Item::Fixed(Fixed::RFC3339)).unwrap(), @"yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'");
+        assert_snapshot!(ch.translate_format_item(Item::Fixed(Fixed::ShortMonthName)).unwrap(), @"MMM");
+        assert_snapshot!(ch.translate_format_item(Item::Fixed(Fixed::LongMonthName)).unwrap(), @"MMMM");
+        assert_snapshot!(ch.translate_format_item(Item::Fixed(Fixed::ShortWeekdayName)).unwrap(), @"EEE");
+        assert_snapshot!(ch.translate_format_item(Item::Fixed(Fixed::LongWeekdayName)).unwrap(), @"EEEE");
+        assert_snapshot!(ch.translate_format_item(Item::Fixed(Fixed::UpperAmPm)).unwrap(), @"aa");
+        assert_snapshot!(ch.translate_format_item(Item::Fixed(Fixed::RFC3339)).unwrap(), @"yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'");
     }
 
     #[test]
     fn clickhouse_translate_literal() {
         let ch = ClickHouseDialect;
         // Punctuation passes through unchanged (it's literal in a Joda pattern).
-        assert_snapshot!(ch.translate_chrono_item(Item::Literal("-")).unwrap(), @"-");
-        assert_snapshot!(ch.translate_chrono_item(Item::Literal("/")).unwrap(), @"/");
+        assert_snapshot!(ch.translate_format_item(Item::Literal("-")).unwrap(), @"-");
+        assert_snapshot!(ch.translate_format_item(Item::Literal("/")).unwrap(), @"/");
         // Alphanumeric runs are wrapped in single quotes so Joda treats them as
         // literal text rather than pattern letters.
-        assert_snapshot!(ch.translate_chrono_item(Item::Literal("foo")).unwrap(), @"'foo'");
+        assert_snapshot!(ch.translate_format_item(Item::Literal("foo")).unwrap(), @"'foo'");
         // An apostrophe inside an alphanumeric literal is escaped as a pair so
         // the quoted section doesn't end there.
-        assert_snapshot!(ch.translate_chrono_item(Item::Literal("o'clock")).unwrap(), @r"'o\'\'clock'");
+        assert_snapshot!(ch.translate_format_item(Item::Literal("o'clock")).unwrap(), @r"'o\'\'clock'");
         // A trailing apostrophe is escaped after the closing quote instead, so
         // sqlparser still doubles that quote.
-        assert_snapshot!(ch.translate_chrono_item(Item::Literal("foo'")).unwrap(), @r"'foo'\'\'");
+        assert_snapshot!(ch.translate_format_item(Item::Literal("foo'")).unwrap(), @r"'foo'\'\'");
         // A literal apostrophe is rendered as an escaped pair so it survives,
         // through the single-quoted SQL string literal it's embedded in, into
         // the Joda pattern as `''` (Joda's escape for a literal apostrophe).
-        assert_snapshot!(ch.translate_chrono_item(Item::Literal("'")).unwrap(), @r"\'\'");
+        assert_snapshot!(ch.translate_format_item(Item::Literal("'")).unwrap(), @r"\'\'");
     }
 
     #[test]
     fn clickhouse_translate_space() {
         let ch = ClickHouseDialect;
         // See `bigquery_translate_space` for why these aren't snapshots.
-        assert_eq!(ch.translate_chrono_item(Item::Space(" ")).unwrap(), " ");
-        assert_eq!(ch.translate_chrono_item(Item::Space("  ")).unwrap(), "  ");
+        assert_eq!(ch.translate_format_item(Item::Space(" ")).unwrap(), " ");
+        assert_eq!(ch.translate_format_item(Item::Space("  ")).unwrap(), "  ");
     }
 
     // -- unsupported-specifier errors --
@@ -1056,61 +1059,61 @@ mod tests {
         // `%P` (lowercase am/pm) is mapped by none of them.
         let lower_am_pm = || Item::Fixed(Fixed::LowerAmPm);
         assert_snapshot!(
-            PostgresDialect.translate_chrono_item(lower_am_pm()).unwrap_err().reason,
+            PostgresDialect.translate_format_item(lower_am_pm()).unwrap_err().reason,
             @"format specifier `%P` is not supported for Postgres");
         assert_snapshot!(
-            RedshiftDialect.translate_chrono_item(lower_am_pm()).unwrap_err().reason,
+            RedshiftDialect.translate_format_item(lower_am_pm()).unwrap_err().reason,
             @"format specifier `%P` is not supported for Redshift");
         assert_snapshot!(
-            MsSqlDialect.translate_chrono_item(lower_am_pm()).unwrap_err().reason,
+            MsSqlDialect.translate_format_item(lower_am_pm()).unwrap_err().reason,
             @"format specifier `%P` is not supported for MSSQL");
         assert_snapshot!(
-            MySqlDialect.translate_chrono_item(lower_am_pm()).unwrap_err().reason,
+            MySqlDialect.translate_format_item(lower_am_pm()).unwrap_err().reason,
             @"format specifier `%P` is not supported for MySQL");
         assert_snapshot!(
-            ClickHouseDialect.translate_chrono_item(lower_am_pm()).unwrap_err().reason,
+            ClickHouseDialect.translate_format_item(lower_am_pm()).unwrap_err().reason,
             @"format specifier `%P` is not supported for ClickHouse");
         assert_snapshot!(
-            DuckDbDialect.translate_chrono_item(lower_am_pm()).unwrap_err().reason,
+            DuckDbDialect.translate_format_item(lower_am_pm()).unwrap_err().reason,
             @"format specifier `%P` is not supported for DuckDB");
         assert_snapshot!(
-            BigQueryDialect.translate_chrono_item(lower_am_pm()).unwrap_err().reason,
+            BigQueryDialect.translate_format_item(lower_am_pm()).unwrap_err().reason,
             @"format specifier `%P` is not supported for BigQuery");
     }
 
-    /// chrono turns an escape it doesn't recognize into `Item::Error`, which
+    /// An escape `strftime::items` doesn't recognize is `Item::Error`, which
     /// has no specifier to name — the format string is malformed rather than
     /// beyond the dialect's reach.
     #[test]
     fn unrecognized_escape_reports_a_malformed_format_string() {
         assert_snapshot!(
-            BigQueryDialect.translate_chrono_item(Item::Error).unwrap_err().reason,
+            BigQueryDialect.translate_format_item(Item::Error).unwrap_err().reason,
             @"date format string contains an unrecognized specifier");
         assert_snapshot!(
-            PostgresDialect.translate_chrono_item(Item::Error).unwrap_err().reason,
+            PostgresDialect.translate_format_item(Item::Error).unwrap_err().reason,
             @"date format string contains an unrecognized specifier");
         // End to end, so that the `Item::Error` premise stays pinned to what
-        // chrono actually yields for an escape it doesn't recognize.
+        // `strftime::items` actually yields for an escape it doesn't recognize.
         assert_snapshot!(
             PostgresDialect.translate_prql_date_format("%Q").unwrap_err().reason,
             @"date format string contains an unrecognized specifier");
     }
 
-    /// A specifier chrono understands but we have no spelling for keeps the
-    /// generic message rather than leaking chrono's `Debug` variant name.
+    /// A specifier the syntax has but we have no spelling for keeps the
+    /// generic message rather than leaking an item's `Debug` variant name.
     #[test]
     fn unnameable_specifier_keeps_the_generic_message() {
         assert_snapshot!(
             PostgresDialect
-                .translate_chrono_item(Item::Numeric(Numeric::Ordinal, Pad::Zero))
+                .translate_format_item(Item::Numeric(Numeric::Ordinal, Pad::Zero))
                 .unwrap_err()
                 .reason,
             @"PRQL doesn't support this format specifier");
     }
 
-    /// chrono parses its aliases down to the same `Item` and keeps no source
+    /// An alias parses down to the same `Item`, which keeps no source
     /// offsets, so an alias is named by its canonical spelling: `%e` is
-    /// reported as `%_d`, the form chrono documents it as equal to.
+    /// reported as `%_d`, the form chrono's syntax documents it as equal to.
     #[test]
     fn alias_specifier_is_named_by_its_canonical_spelling() {
         assert_snapshot!(
@@ -1121,7 +1124,7 @@ mod tests {
             @"format specifier `%_d` is not supported for Postgres");
     }
 
-    /// chrono keeps a `"` inside a literal that also has letters, such as
+    /// A literal that also has letters can hold a `"`, such as
     /// `x"y`, so the double-quoted section wrapping it must escape the `"`
     /// rather than let it close the section early.
     #[test]
@@ -1185,6 +1188,98 @@ mod tests {
         assert_snapshot!(
             MsSqlDialect.translate_prql_date_format(r"%Y \ %d").unwrap(),
             @r"yyyy \\ dd");
+    }
+    // -- translate_prql_date_format: the edges of the format string syntax --
+    //
+    // Every answer below is the one prqlc gave when chrono's `StrftimeItems`
+    // split the string, so these pin the splitting `strftime::items` keeps.
+
+    fn refusal(dialect: &dyn DialectHandler, format: &str) -> String {
+        dialect
+            .translate_prql_date_format(format)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn date_format_percent_signs() {
+        assert_snapshot!(PostgresDialect.translate_prql_date_format("100%% in %d days").unwrap(), @r#""100"% "in" DD "days""#);
+        assert_snapshot!(PostgresDialect.translate_prql_date_format("%%%Y").unwrap(), @"%YYYY");
+        assert_snapshot!(DuckDbDialect.translate_prql_date_format("100%% in %d days").unwrap(), @"100%% in %d days");
+        assert_snapshot!(MsSqlDialect.translate_prql_date_format("100%% in %d days").unwrap(), @r#""100"\% "in" dd "days""#);
+        assert_snapshot!(MySqlDialect.translate_prql_date_format("%%").unwrap(), @"%%");
+        assert_snapshot!(BigQueryDialect.translate_prql_date_format("%%").unwrap(), @"%%");
+    }
+
+    #[test]
+    fn date_format_trailing_percent() {
+        assert_snapshot!(refusal(&PostgresDialect, "%Y %"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&DuckDbDialect, "%%%"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%Y %"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+    }
+
+    #[test]
+    fn date_format_padding_modifiers() {
+        assert_snapshot!(PostgresDialect.translate_prql_date_format("%-d").unwrap(), @"FMDD");
+        assert_snapshot!(PostgresDialect.translate_prql_date_format("%0d").unwrap(), @"DD");
+        assert_snapshot!(DuckDbDialect.translate_prql_date_format("%-H").unwrap(), @"%-H");
+        assert_snapshot!(MySqlDialect.translate_prql_date_format("%-d").unwrap(), @"%e");
+        assert_snapshot!(MsSqlDialect.translate_prql_date_format("%-d").unwrap(), @"d");
+
+        // A padding a dialect has no form for.
+        assert_snapshot!(refusal(&PostgresDialect, "%_d"), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%_d` is not supported for Postgres"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&PostgresDialect, "%-y"), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%-y` is not supported for Postgres"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&DuckDbDialect, "%_H"), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%_H` is not supported for DuckDB"), hints: [], code: None }"#);
+        // `%e` is `%_d`, and `%k` is `%_H`.
+        assert_snapshot!(refusal(&MySqlDialect, "%e"), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%_d` is not supported for MySQL"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&MySqlDialect, "%k"), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%_H` is not supported for MySQL"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%_d"), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%_d` is not supported for BigQuery"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%e"), @r#"Error { kind: Error, span: None, reason: Simple("format specifier `%_d` is not supported for BigQuery"), hints: [], code: None }"#);
+
+        // A padding modifier on a shorthand for several items is no specifier.
+        assert_snapshot!(refusal(&PostgresDialect, "%-D"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&DuckDbDialect, "%-D"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%-D"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+    }
+
+    #[test]
+    fn date_format_unknown_specifiers() {
+        assert_snapshot!(refusal(&PostgresDialect, "%Q"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%Q"), @r#"Error { kind: Error, span: None, reason: Simple("date format string contains an unrecognized specifier"), hints: [], code: None }"#);
+
+        // Specifiers BigQuery refuses that have no strftime spelling, so the
+        // refusal names none.
+        assert_snapshot!(refusal(&BigQueryDialect, "%j"), @r#"Error { kind: Error, span: None, reason: Simple("PRQL doesn't support this format specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%q"), @r#"Error { kind: Error, span: None, reason: Simple("PRQL doesn't support this format specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%Z"), @r#"Error { kind: Error, span: None, reason: Simple("PRQL doesn't support this format specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%#z"), @r#"Error { kind: Error, span: None, reason: Simple("PRQL doesn't support this format specifier"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&BigQueryDialect, "%3f"), @r#"Error { kind: Error, span: None, reason: Simple("PRQL doesn't support this format specifier"), hints: [], code: None }"#);
+    }
+
+    #[test]
+    fn date_format_non_ascii_text() {
+        assert_snapshot!(PostgresDialect.translate_prql_date_format("日本 %Y").unwrap(), @"日本 YYYY");
+        assert_snapshot!(PostgresDialect.translate_prql_date_format("aé").unwrap(), @r#""aé""#);
+        assert_snapshot!(DuckDbDialect.translate_prql_date_format("é%-dé").unwrap(), @"é%-dé");
+        assert_snapshot!(ClickHouseDialect.translate_prql_date_format("é").unwrap(), @"é");
+        assert_snapshot!(ClickHouseDialect.translate_prql_date_format("aé").unwrap(), @"'aé'");
+        // A no-break space is whitespace, so it splits the literal text around it.
+        assert_eq!(
+            PostgresDialect
+                .translate_prql_date_format("a\u{a0}b")
+                .unwrap(),
+            "\"a\"\u{a0}\"b\""
+        );
+    }
+
+    #[test]
+    fn date_format_empty_string() {
+        // No items, so even a dialect that formats no dates has nothing to refuse.
+        assert_snapshot!(GenericDialect.translate_prql_date_format("").unwrap(), @"");
+        assert_snapshot!(SQLiteDialect.translate_prql_date_format("").unwrap(), @"");
+        assert_snapshot!(refusal(&GenericDialect, "%Y"), @r#"Error { kind: Error, span: None, reason: Simple("Date formatting requires a dialect"), hints: [], code: None }"#);
+        assert_snapshot!(refusal(&SQLiteDialect, "%Y"), @r#"Error { kind: Error, span: None, reason: Simple("Date formatting is not yet supported for this dialect"), hints: [], code: None }"#);
     }
 }
 
