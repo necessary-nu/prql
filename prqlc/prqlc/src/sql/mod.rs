@@ -7,6 +7,7 @@ mod gen_query;
 mod keywords;
 mod operators;
 mod pq;
+mod strftime;
 
 pub use dialect::{Dialect, SupportLevel};
 pub use pq::ast as pq_ast;
